@@ -37,6 +37,23 @@ first character of an element's name selects its type:
     z,y,h,g,a,b  two-port block     name,n1,n2[,[p11,p12,p21,p22]]
                                  or name,[tl,bl],[tr,br][,[p11,p12,p21,p22]]
 
+Fork additions (the interface for ahkab draws its nonlinear devices;
+Symbulator itself never solves these, so its own kinds and behaviour
+are untouched -- these letters were unused):
+
+    d  diode                 name,anode,cathode[,label]
+    n  n-channel MOSFET       name,nd,ng,ns,nb[,label]   (SPICE order:
+    p  p-channel MOSFET       name,nd,ng,ns,nb[,label]    drain, gate,
+                                                         source, bulk)
+    w  voltage-controlled switch  name,n1,n2,sn1,sn2[,control]
+
+The label is free text shown at the element (a model name, a W/L);
+a switch's last term is what controls it, written as a dependent
+source's value is (`vin`, `vr1`, `(v3-v4)`), and when it is left out
+the drawing writes the control as the voltage from sn1 to sn2. The
+switch's control nodes sense a voltage and conduct nothing, so they
+are not among the element's `nodes`.
+
 Node "0" is the ground/reference node.
 
 A transformer and a two-port block have two ports, and each port has
@@ -58,7 +75,7 @@ from typing import Sequence, List, Optional
 
 from .si_prefix import expand_shorthand
 
-VALID_PREFIXES = "abceghjlmorstyz"
+VALID_PREFIXES = "abceghjlmorstyz" + "dnpw"   # the last four: fork
 
 # name,n1,n2[,...]  -- total field count including the element's own name.
 FIELD_COUNTS = {
@@ -77,7 +94,25 @@ FIELD_COUNTS = {
     "g": 3,
     "a": 3,
     "b": 3,
+    # fork: the nonlinear devices, each with an optional last term
+    "d": 3,
+    "n": 5,
+    "p": 5,
+    "w": 5,
 }
+
+# Fork: the kinds whose last term is an optional label (a diode's or a
+# MOSFET's model name) or, for the switch, its optional control
+# expression. Either count is accepted, as for l/c's initial condition.
+OPTIONAL_LABEL_KINDS = {"d", "n", "p", "w"}
+
+# Fork: the two MOSFET kinds, written in SPICE's terminal order --
+# drain, gate, source, bulk. `Element.n1` is the drain and `Element.n2`
+# the **source**, so that the drain-source channel is the element's
+# two-terminal path to everything that reads n1 and n2 (the grounding
+# test, the node walk, the layout); `gate` and `bulk` name the other
+# two.
+MOS_KINDS = frozenset("np")
 
 # l/c may optionally carry one extra field -- an initial condition
 # (initial inductor current / initial capacitor voltage) -- used only by
@@ -197,14 +232,48 @@ class Element:
     @property
     def n2(self) -> str:
         """Second node/terminal (fields[1]) -- same as n1, always in the
-        same position regardless of element kind."""
+        same position regardless of element kind.
+
+        Fork: for a MOSFET (kinds n and p, written drain, gate, source,
+        bulk) this is the **source**, fields[2], so that n1-n2 is the
+        channel -- the path the drawing lays out as the element's own."""
+        if self.kind in MOS_KINDS:
+            return self.fields[2]
         return self.fields[1]
+
+    # -- fork: the nonlinear devices' extra terminals ----------------------
+
+    @property
+    def gate(self) -> Optional[str]:
+        """A MOSFET's gate node (fields[1]); None for every other kind."""
+        return self.fields[1] if self.kind in MOS_KINDS else None
+
+    @property
+    def bulk(self) -> Optional[str]:
+        """A MOSFET's bulk node (fields[3]); None for every other kind."""
+        return self.fields[3] if self.kind in MOS_KINDS else None
+
+    @property
+    def control_nodes(self):
+        """A switch's two sensing nodes, (sn1, sn2): the switch closes on
+        v(sn1) - v(sn2). They conduct nothing and are not terminals.
+        () for every other kind."""
+        if self.kind == "w":
+            return (self.fields[2], self.fields[3])
+        return ()
 
     @property
     def value(self) -> Optional[str]:
-        """Raw value expression, for element kinds that have one."""
+        """Raw value expression, for element kinds that have one.
+
+        Fork: a diode's, a MOSFET's or a switch's optional last term --
+        a label, or the switch's control -- is its value, and None when
+        it was left out."""
         if self.kind in ("r", "l", "c", "e", "j", "m"):
             return self.fields[2]
+        if self.kind in OPTIONAL_LABEL_KINDS:
+            idx = _VALUE_IDX[self.kind]
+            return self.fields[idx] if len(self.fields) > idx else None
         return None
 
     @property
@@ -252,6 +321,9 @@ class Element:
             (tl, bl), (tr, br) = self.port_nodes
             out = [tl, tr] if not self.four_node else [tl, bl, tr, br]
             return out
+        if self.kind == "w":
+            # fork: the control pair senses; it does not conduct
+            return [self.fields[0], self.fields[1]]
         return [self.fields[i] for i in _IDENTIFIER_FIELD_IDX.get(self.kind, ())
                 if i < len(self.fields)]
 
@@ -291,7 +363,17 @@ _IDENTIFIER_FIELD_IDX = {
     "m": (0, 1),             # the two inductors it couples
     "z": (0, 1), "y": (0, 1), "h": (0, 1), "g": (0, 1),
     "a": (0, 1), "b": (0, 1),
+    # fork: the nonlinear devices
+    "d": (0, 1),             # anode, cathode
+    "n": (0, 1, 2, 3),       # drain, gate, source, bulk
+    "p": (0, 1, 2, 3),
+    "w": (0, 1, 2, 3),       # n1, n2, then the sensing pair sn1, sn2
 }
+
+# Fork: where each optional-last-term kind keeps that term (0-based,
+# after the name): a diode's label follows its two nodes, a MOSFET's or
+# a switch's follows its four.
+_VALUE_IDX = {"d": 2, "n": 4, "p": 4, "w": 4}
 
 
 def _split_elements(desc: str) -> List[str]:
@@ -422,7 +504,8 @@ def parse_circuit(desc: str, expand_si: bool = True,
                                        value=typed.strip())
 
         expected = FIELD_COUNTS[kind]
-        if kind in OPTIONAL_IC_KINDS or kind in TWO_PORT_KINDS:
+        if kind in OPTIONAL_IC_KINDS or kind in TWO_PORT_KINDS \
+                or kind in OPTIONAL_LABEL_KINDS:
             allowed = {expected, expected + 1}
         elif kind == "t":
             # name,n1,n2,N1,N2 -- or the turns as one bracketed pair,
@@ -431,6 +514,10 @@ def parse_circuit(desc: str, expand_si: bool = True,
         else:
             allowed = {expected}
         if len(parts) not in allowed:
+            if kind in OPTIONAL_LABEL_KINDS:
+                raise CircuitError(M.E_TERMS_WITH_LABEL, name=name,
+                                   got=len(parts), expected=expected,
+                                   expected_label=expected + 1, kind=kind)
             if kind in OPTIONAL_IC_KINDS:
                 raise CircuitError(M.E_TERMS_WITH_IC, name=name,
                                    got=len(parts), expected=expected,
@@ -711,6 +798,8 @@ def _validate_topology(elements: List[Element], two_port_nodes: Optional[tuple] 
 
             if el.kind in PORT_KINDS or el.n1 == "0" or el.n2 == "0":
                 has_ground = True
+            elif el.kind in MOS_KINDS and "0" in el.nodes:
+                has_ground = True       # fork: a grounded gate or bulk
 
         if refs and any(n in refs for n in el.nodes):
             has_ground = True

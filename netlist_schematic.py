@@ -18,6 +18,14 @@ the first node of a voltage source is its + terminal, a current source
 drives current from its first node through itself to its second, and the
 current through a voltage source is taken the same way round, so
 dependent sources translate without any change of sign.
+
+The nonlinear devices go to the fork's own kinds: a diode is ``d``
+(anode, cathode), a MOSFET ``n`` or ``p`` by its model's channel type
+(drain, gate, source, bulk -- ahkab's order, read off ``n1``, ``ng``,
+``n2``, ``nb``), a switch ``w`` (its two output nodes, then its two
+sensing nodes, then what it senses written the way a dependent source's
+control is, so the drawing marks the sensed element). A diode is
+labelled by its model, a MOSFET by its model and W/L.
 """
 
 import math
@@ -30,13 +38,26 @@ KINDS = {
     'EVSource': 'e', 'HVSource': 'e',     # voltage-controlled, current-controlled
     'GISource': 'j', 'FISource': 'j',
     'InductorCoupling': 'm',
+    'diode': 'd', 'switch_device': 'w',
+    # a MOSFET is 'n' or 'p' by its model; see kind_of
 }
+MOS_CLASSES = ('mosq_device', 'ekv_device')
 
-# Readable names for what the drawing cannot show yet.
-UNSUPPORTED_NAMES = {
-    'diode': 'diode', 'mosq_device': 'MOSFET', 'ekv_device': 'MOSFET',
-    'switch_device': 'switch',
-}
+
+def kind_of(el):
+    """The Symbulator kind letter for an ahkab element, or None."""
+    cls = type(el).__name__
+    if cls in MOS_CLASSES:
+        model = el.mosq_model if cls == 'mosq_device' else el.ekv_model
+        return 'n' if model.NPMOS == 1 else 'p'
+    return KINDS.get(cls)
+
+
+# Readable names for what the drawing cannot show. Empty now that the
+# diode, the MOSFET and the switch draw; kept so an element class this
+# translator has never met is still reported by name rather than drawn
+# wrong.
+UNSUPPORTED_NAMES = {}
 
 _PREFIXES = [(1e9, 'G'), (1e6, 'M'), (1e3, 'k'), (1.0, ''), (1e-3, 'm'),
              (1e-6, 'u'), (1e-9, 'n'), (1e-12, 'p'), (1e-15, 'f')]
@@ -111,12 +132,12 @@ class Translation(object):
         # Name every translatable element first, so a controlled source can
         # refer to one that appears later in the netlist.
         for el in elements:
-            kind = KINDS.get(type(el).__name__)
+            kind = kind_of(el)
             if kind:
                 self.name(kind, el.part_id)
         for el in elements:
             cls = type(el).__name__
-            kind = KINDS.get(cls)
+            kind = kind_of(el)
             if kind is None:
                 self.unsupported.append((el.part_id, UNSUPPORTED_NAMES.get(cls, cls)))
                 continue
@@ -129,10 +150,32 @@ class Translation(object):
                     continue
                 self.lines.append('%s,%s,%s,k=%s' % (me, l1, l2, gain(el.K)))
                 continue
+            if kind in ('n', 'p'):
+                # ahkab's mosq_device and ekv_device: n1 is the drain, ng
+                # the gate, n2 the source, nb the bulk (mosq.py, ekv.py).
+                self.lines.append('%s,%s,%s,%s,%s,%s' % (
+                    me, self.node(el.n1), self.node(el.ng), self.node(el.n2),
+                    self.node(el.nb), self._mos_label(el)))
+                continue
+            if kind == 'w':
+                # switch_device: n1, n2 conduct; sn1, sn2 sense (switch.py)
+                self.lines.append('%s,%s,%s,%s,%s,%s' % (
+                    me, self.node(el.n1), self.node(el.n2), self.node(el.sn1),
+                    self.node(el.sn2), self._voltage(el.sn1, el.sn2, el)))
+                continue
             value = self._value(el, cls)
             self.lines.append('%s,%s,%s,%s' % (me, self.node(el.n1), self.node(el.n2), value))
 
+    def _mos_label(self, el):
+        """``nch 1µ/1µ``: the model's name and the device's W/L, the way
+        an analogue schematic annotates a transistor."""
+        model = el.mosq_model if type(el).__name__ == 'mosq_device' else el.ekv_model
+        w, l = si(el.device.W), si(el.device.L)
+        return '%s %s/%s' % (_label(model.name), w.replace('u', 'µ'), l.replace('u', 'µ'))
+
     def _value(self, el, cls):
+        if cls == 'diode':
+            return _label(el.model.name)
         if cls in ('Resistor', 'Capacitor', 'Inductor'):
             return si(el.value)
         if cls in ('VSource', 'ISource'):
@@ -153,7 +196,7 @@ class Translation(object):
         across an element connected exactly there, so the drawing marks the
         control on that element."""
         for el in self.circ:
-            if el is not source and KINDS.get(type(el).__name__) in ('r', 'c', 'l', 'e', 'j'):
+            if el is not source and kind_of(el) in ('r', 'c', 'l', 'e', 'j', 'd', 'w'):
                 me = self.names[el.part_id.lower()]
                 if (el.n1, el.n2) == (a, b):
                     return 'v%s' % me
@@ -164,6 +207,12 @@ class Translation(object):
         if self.node(a) == '0':
             return '(-v%s)' % self.node(b)
         return '(v%s-v%s)' % (self.node(a), self.node(b))
+
+
+def _label(text):
+    """A model name as a label term: the description's separators and
+    the generator's own notation (brackets, quotes) taken out."""
+    return re.sub(r"[,:\[\]'\s]+", ' ', str(text)).strip() or 'model'
 
 
 def draw(circ):

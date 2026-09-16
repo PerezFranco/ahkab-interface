@@ -67,6 +67,16 @@ Colours are left to CSS: every stroke is `currentColor`, so one drawing
 works in both the light and dark themes of the site; the reference
 blue is `var(--schematic-ref)` with the book's #005B7F as its default,
 so a dark theme can lighten it.
+
+Fork: the interface for ahkab also draws a diode (`d`), a MOSFET (`n`,
+`p`) and a voltage-controlled switch (`w`). The diode and the switch
+are two-terminal elements like any other; the switch shows what
+controls it as a dependent source shows its control, on the element it
+senses. The MOSFET's channel is laid out as its two-terminal path and
+its gate and bulk are side leads with routes of their own -- see the
+notes at `_Layout._plan_mosfets`. None of these symbols is the book's
+(it draws none), so their geometry is provisional: see the constants
+under "fork: the nonlinear devices".
 """
 
 from __future__ import annotations
@@ -76,7 +86,8 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from . import messages as M
-from .elements import Element, CircuitError, parse_circuit, _coupling_factor
+from .elements import (Element, CircuitError, parse_circuit, _coupling_factor,
+                       MOS_KINDS)
 
 __all__ = ["to_svg", "draw"]
 
@@ -86,7 +97,13 @@ __all__ = ["to_svg", "draw"]
 # drawing instead of placed in it; everything else falls back to a
 # labelled rectangle, so an unrecognised kind still draws something
 # honest.
-TWO_TERMINAL = frozenset("rlcejs")
+#
+# Fork: the diode (`d`) and the voltage-controlled switch (`w`) are
+# two-terminal too -- the switch's sensing pair is not wired, it is
+# written on the switch the way a dependent source's control is written
+# in its value. The MOSFET (`n`, `p`) is four-terminal and has a
+# placement of its own; see `_Layout._plan_mosfets` and `_draw_mosfet`.
+TWO_TERMINAL = frozenset("rlcejs" + "dw")
 
 # The two-port parameter families. They take two node names and ground
 # their other two terminals themselves, so they are drawn as a block
@@ -441,11 +458,59 @@ REF_ARROW_MIN = 14.0   # shortest half-length the shaft is drawn at
 # the path geometry called 3px clear of the zigzag was 1px clear of its
 # ink, which is what a reader sees as touching (#212).
 # `tools/pixel_clearance.py` is that measurement, kept.
+# --- fork: the nonlinear devices ------------------------------------
+# Nilsson & Riedel is a linear-circuits book and draws none of these,
+# so the numbers below are not measured from it. They are chosen to
+# stand in the book's proportion to the symbols that are: the diode's
+# triangle is as tall as the resistor's zigzag and about as long as the
+# capacitor's plate gap, the switch's contacts sit as far apart as the
+# source circle is wide, and the MOSFET's channel is a shade longer
+# than the resistor's zigzag, since a transistor is the largest ordinary
+# symbol in every book that draws one. Every stroke is the body weight.
+# **Each of these is a matter of taste and awaits Roberto's ruling.**
+DIODE_LEN = 9.0 * PT          # the triangle, anode to cathode, 14.4
+DIODE_HALF = 5.0 * PT         # half its base, and half the bar, 8.0
+SW_HALF = 12.0                # a switch's contacts, either side of centre
+SW_RISE = 9.0                 # how high the open blade lifts at its tip
+MOS_CH = 26.0                 # the channel bar, along the element
+MOS_JOG = 12.0                # the channel's offset from the lead axis,
+#                               toward the gate; the bulk arrow lives here
+MOS_GAP = 2.0 * PT            # gate bar to channel, 3.2
+MOS_GATE_BAR = 22.0           # the gate bar's length
+MOS_GATE_LEAD = 8.0           # from the gate bar out to the wire
+MOS_BULK_OUT = 10.0           # an untied bulk lead, past the axis
+MOS_ARROW = 6.0               # the bulk arrow's head, and its half-width
+MOS_ARROW_HALF = 2.0
+# How far a MOSFET's gate structure reaches across the axis on the gate
+# side: the gate bar's centreline plus half a stroke.
+MOS_GATE_REACH = MOS_JOG + MOS_GAP + _HALF
+# A horizontal MOSFET's body, with a lead each side, is drawn on a
+# stretch of this length centred on its own column, and plain wire runs
+# from there to its nodes (see `_render_once`).
+MOS_STRETCH = MOS_CH + 2 * 26.0
+# A gate or bulk lead that cannot join its node beside the element runs
+# along a lane **above** the node row -- above rather than below, since
+# below is where every hanging body is -- this far over the row of the
+# highest element it serves, one step further per lane when two lanes
+# to different nodes would otherwise share a line and be read as joined.
+GATE_LANE = 34.0
+GATE_LANE_TALL = 56.0         # when the run passes over the labels that
+#                               stand above another element on that level
+GATE_LANE_STEP = 14.0
+GATE_LANE_CLEAR = 42.0        # what a lifted element hangs below its
+#                               axis (a source's value: 34) plus air
+# A lead leaving a horizontal MOSFET's underside for a live node runs
+# this far under the element's row before turning, as an op-amp's lower
+# input does (16 there; a bulk lead already stands MOS_BULK_OUT out).
+MOS_UNDER = 22.0
+
 REACH = {"r": ZIG_PEAK + _HALF,
          "l": IND_REACH + _HALF,
          "c": CAP_HALF + _HALF,
          "e": SRC_R + _HALF, "j": SRC_R + _HALF,
-         "s": _HALF}
+         "s": _HALF,
+         "d": DIODE_HALF + _HALF,      # fork
+         "w": SW_RISE + _HALF}
 REACH_BOX = 13.0 + _HALF   # the fallback labelled rectangle
 
 
@@ -598,18 +663,39 @@ def _strip_outer_parens(text: str) -> str:
     return text
 
 
+def _switch_control(e: Element) -> str:
+    """Fork: what a switch is shown to be controlled by when its
+    description names no control -- the voltage from sn1 to sn2, spelt
+    as a dependent source's value would spell it, so `_value_runs`
+    sets it as *v*_IN or (*v*_A - *v*_B)."""
+    sn1, sn2 = e.control_nodes
+    if sn2 == "0":
+        return "v" + sn1
+    if sn1 == "0":
+        return "(-v" + sn2 + ")"
+    return "(v{0}-v{1})".format(sn1, sn2)
+
+
 def _pretty(e: Element) -> str:
     """Label text for an element value: shown the way the reader typed
     it (raw_fields survives shorthand expansion -- a phasor stays
     `110∠0°` instead of its 17-digit rectangular expansion), with the
     SI-prefix quote dropped (1'k -> 1k), redundant outer parentheses
     removed, long float literals rounded, and a unit appended when the
-    value is a bare number rather than a symbol."""
+    value is a bare number rather than a symbol.
+
+    Fork: a diode's, a MOSFET's or a switch's value is its optional
+    last term -- a label, or the switch's control -- and sits after its
+    nodes rather than in the third field; a switch with no control
+    written is labelled with its sensing pair (`_switch_control`)."""
     raw = e.value
+    if raw is None and e.kind == "w":
+        raw = _switch_control(e)
     if raw is None:
         return ""
-    if e.raw_fields and len(e.raw_fields) > 2:
-        raw = e.raw_fields[2]
+    idx = 4 if e.kind in ("n", "p", "w") else 2
+    if e.raw_fields and len(e.raw_fields) > idx:
+        raw = e.raw_fields[idx]
     val = raw.replace("'", "").strip()
     val = _strip_outer_parens(val)
     val = _round_long_floats(val)
@@ -1149,8 +1235,84 @@ def _body_box(length: float, letter: str) -> str:
                     lead + BODY / 2, _esc(letter)))
 
 
+def _body_d(length: float) -> str:
+    """Fork: a diode -- an open triangle pointing from the anode (the
+    n1 end) to the cathode, and the cathode's bar across its tip. Open
+    rather than filled, as the sources' outlines are, and mitred at its
+    corners as the dependent source's diamond is."""
+    mid = length / 2.0
+    xa, xb = mid - DIODE_LEN / 2.0, mid + DIODE_LEN / 2.0
+    return ('<path d="M0 0 L{0:g} 0 M{1:g} 0 L{2:g} 0"/>'
+            '<path d="M{0:g} {3:g} L{1:g} 0 L{0:g} {4:g} Z" fill="none" '
+            'stroke-linejoin="miter"/>'
+            '<path d="M{1:g} {3:g} L{1:g} {4:g}"/>'
+            .format(xa, xb, length, -DIODE_HALF, DIODE_HALF))
+
+
+def _body_w(length: float) -> str:
+    """Fork: a switch, drawn open -- the blade hinged at the n1 contact
+    and lifted clear of the n2 contact. Which way it leans is the
+    symbol's own: toward -y, which `_draw_element`'s transform puts
+    above a horizontal switch and to the right of a vertical one, the
+    side its labels are on."""
+    mid = length / 2.0
+    xa, xb = mid - SW_HALF, mid + SW_HALF
+    return ('<path d="M0 0 L{0:g} 0 M{1:g} 0 L{2:g} 0"/>'
+            '<path d="M{0:g} 0 L{3:g} {4:g}"/>'
+            .format(xa, xb, length, xb - 1.0, -SW_RISE))
+
+
+def _body_mos(length: float, p_channel: bool, tied: bool) -> str:
+    """Fork: a MOSFET along the axis, drain at 0 and source at `length`,
+    its gate toward -y. The four-terminal symbol: a channel bar offset
+    MOS_JOG from the lead axis, the drain and source leads jogging out
+    to its ends, the gate bar parallel to it across MOS_GAP with its
+    lead leaving outward, and the bulk leaving the channel's middle the
+    other way -- across the axis to a terminal of its own when it is
+    wired elsewhere (`tied` False), or, when it is the source's, only
+    as far as the axis and then along it to the source's jog, the way
+    a CAD symbol shows a substrate tied to its source.
+
+    **The channel type is the bulk arrow, nothing else**: pointing into
+    the channel for n-channel (the p-substrate to n-channel junction),
+    out of it for p-channel -- the one mark every book agrees on. The
+    head is the current source's own, at a MOSFET's scale."""
+    mid = length / 2.0
+    a, b = mid - MOS_CH / 2.0, mid + MOS_CH / 2.0
+    jog = -MOS_JOG
+    gate_y = -(MOS_JOG + MOS_GAP)
+    parts = [
+        # drain lead, out to the channel; source lead back and away
+        '<path d="M0 0 L{0:g} 0 L{0:g} {1:g}"/>'.format(a, jog),
+        '<path d="M{0:g} {1:g} L{0:g} 0 L{2:g} 0"/>'.format(b, jog, length),
+        # the channel and the gate, two bars
+        '<path d="M{0:g} {1:g} L{2:g} {1:g}"/>'.format(a, jog, b),
+        '<path d="M{0:g} {1:g} L{2:g} {1:g}"/>'.format(
+            mid - MOS_GATE_BAR / 2.0, gate_y, mid + MOS_GATE_BAR / 2.0),
+        '<path d="M{0:g} {1:g} L{0:g} {2:g}"/>'.format(
+            mid, gate_y, gate_y - MOS_GATE_LEAD),
+    ]
+    if tied:
+        parts.append('<path d="M{0:g} {1:g} L{0:g} 0 L{2:g} 0"/>'
+                     .format(mid, jog, b))
+    else:
+        parts.append('<path d="M{0:g} {1:g} L{0:g} {2:g}"/>'
+                     .format(mid, jog, MOS_BULK_OUT))
+    # The arrow, on the bulk's run between the channel and the axis.
+    if p_channel:
+        tip, base = jog + MOS_ARROW + 2.0, jog + 2.0
+    else:
+        tip, base = jog, jog + MOS_ARROW
+    parts.append('<path d="M{0:g} {1:g} L{2:g} {3:g} L{4:g} {3:g} Z" '
+                 'fill="currentColor" stroke="none"/>'
+                 .format(mid, tip, mid - MOS_ARROW_HALF, base,
+                         mid + MOS_ARROW_HALF))
+    return "".join(parts)
+
+
 _BODIES = {"r": _body_r, "c": _body_c, "l": _body_l,
-           "e": _body_e, "j": _body_j, "s": _body_s}
+           "e": _body_e, "j": _body_j, "s": _body_s,
+           "d": _body_d, "w": _body_w}      # fork: d and w
 
 
 def _body_extent(kind: str, length: float,
@@ -1181,6 +1343,10 @@ def _body_extent(kind: str, length: float,
         # let a label sit on the outermost loop.
         half = BODY / 2.0 + IND_OVERHANG
         return mid - half, mid + half
+    if kind == "d":                      # fork: the triangle and its bar
+        return mid - DIODE_LEN / 2.0 - _HALF, mid + DIODE_LEN / 2.0 + _HALF
+    if kind == "w":                      # fork: contact to contact
+        return mid - SW_HALF, mid + SW_HALF
     return mid - BODY / 2.0, mid + BODY / 2.0
 
 
@@ -1196,9 +1362,15 @@ def _fold(token: str) -> str:
 
 def _terminals(e: Element) -> List[str]:
     """The node names an element attaches to. `m` couples two elements
-    rather than two nodes, so it has none; `o` has three."""
+    rather than two nodes, so it has none; `o` has three.
+
+    Fork: a MOSFET has four (drain, gate, source, bulk). A switch has
+    two -- its sensing pair is not attached, but `_ref_keys` still
+    names those nodes, so the control can be lettered."""
     if e.kind == "m":
         return []
+    if e.kind in MOS_KINDS:
+        return list(e.nodes)
     return list(e.fields[:3]) if e.kind == "o" else [e.n1, e.n2]
 
 
@@ -1254,7 +1426,7 @@ def _ref_keys(elements: List[Element]) -> Dict[str, Tuple[str, str, str]]:
     for e in elements:
         if e.kind == "m":
             continue
-        for n in _terminals(e):
+        for n in _terminals(e) + list(e.control_nodes):
             if n != "0":
                 keys.setdefault(_fold("v" + n), ("v", n.upper(), ""))
     for e in elements:
@@ -1280,11 +1452,15 @@ def _references(elements: List[Element]) -> Tuple[frozenset, frozenset]:
     to save them. Hence the polarity pair and the labelled arrow (#213).
 
     A node voltage is a real control and makes a real diamond, but it
-    is not a mark: there is no element to put it on."""
+    is not a mark: there is no element to put it on.
+
+    Fork: a switch's control (`w`, its last term) is read the same
+    way, so the element whose drop closes the switch wears the same
+    polarity pair a dependent source's reference does."""
     keys = _ref_keys(elements)
     vref, iref = set(), set()
     for e in elements:
-        if e.kind not in ("e", "j"):
+        if e.kind not in ("e", "j", "w"):
             continue
         val = (e.value or "").replace("'", "").strip()
         if not val or _NUMERIC.match(val):
@@ -1835,6 +2011,183 @@ def _draw_element(cv: _Canvas, e: Element, x1: float, y1: float,
     return mx, my
 
 
+# --- fork: the MOSFET ------------------------------------------------
+
+def _draw_mosfet(cv: _Canvas, lay: "_Layout", e: Element, x1: float,
+                 y1: float, x2: float, y2: float) -> List[float]:
+    """Draw a MOSFET along the axis-aligned segment (x1,y1)-(x2,y2),
+    drain at the (x1,y1) end, and wire its gate and bulk by the routes
+    the layout planned (`_Layout._plan_mosfets`). Returns the x of each
+    lead it took to the ground rail, for the rail to reach.
+
+    The body is `_body_mos` in local coordinates, gate toward local -y,
+    placed by the same transforms `_draw_element` uses -- plus a mirror
+    across the axis when the plan wants the gate on the other side, the
+    trick the transformer's primary uses to face its core. Labels go on
+    the bulk side, since the gate side carries a wire at mid-height;
+    when the bulk side carries one too they stand a clear `LABEL_CLEAR`
+    above and below it."""
+    plan = lay.mos[e.name]
+    _own = (x1, y1, x2, y2)
+    vertical = abs(x2 - x1) < 0.5
+    length = abs(y2 - y1) if vertical else abs(x2 - x1)
+    tied = plan["tied"]
+    mid = length / 2.0
+    # The frame: screen = origin + a*u + b*v for local (a, b).
+    if vertical:
+        top, bot = min(y1, y2), max(y1, y2)
+        if y1 < y2:
+            ox, oy, u, v = x1, top, (0.0, 1.0), (-1.0, 0.0)
+            tf = "translate({0:g},{1:g}) rotate(90)".format(x1, top)
+        else:
+            ox, oy, u, v = x1, bot, (0.0, -1.0), (1.0, 0.0)
+            tf = "translate({0:g},{1:g}) rotate(-90)".format(x1, bot)
+    else:
+        left, right = min(x1, x2), max(x1, x2)
+        if x1 < x2:
+            ox, oy, u, v = left, y1, (1.0, 0.0), (0.0, 1.0)
+            tf = "translate({0:g},{1:g})".format(left, y1)
+        else:
+            ox, oy, u, v = right, y1, (-1.0, 0.0), (0.0, -1.0)
+            tf = "translate({0:g},{1:g}) rotate(180)".format(right, y1)
+    want = {"L": (-1.0, 0.0), "R": (1.0, 0.0),
+            "U": (0.0, -1.0), "D": (0.0, 1.0)}[plan["gate"]["side"]]
+    if (-v[0], -v[1]) != want:
+        v = (-v[0], -v[1])
+        tf += " scale(1,-1)"
+
+    def at(a: float, b: float) -> Tuple[float, float]:
+        return (ox + u[0] * a + v[0] * b, oy + u[1] * a + v[1] * b)
+
+    body = _body_mos(length, e.kind == "p", tied)
+    anti_reach = (MOS_BULK_OUT if not tied else 3.0) + _HALF
+    c1 = at(mid - MOS_CH / 2.0 - _HALF, -MOS_GATE_REACH)
+    c2 = at(mid + MOS_CH / 2.0 + _HALF, anti_reach)
+    cv.raw('<g transform="{0}" stroke-width="{2:g}">{1}</g>'
+           .format(tf, body, BODY_STROKE), c1, c2)
+    cv.ink(c1[0], c1[1], c2[0], c2[1])
+    cv.eseg(x1, y1, x2, y2, half=MOS_CH / 2.0)
+
+    # Labels, on the bulk side. A lead running there at mid-height
+    # pushes them a clear LABEL_CLEAR off it.
+    mx, my = at(mid, 0.0)
+    val_runs = _value_runs(e, lay.refs)
+    if len(_flat(val_runs)) > CAPTION_LEN:
+        val_runs = []
+    nm = _name_runs(e.name)
+    bulk_lead = plan["bulk"] is not None
+    if vertical:
+        s = 1.0 if plan["gate"]["side"] == "L" else -1.0
+        anchor = "start" if s > 0 else "end"
+        lx = mx + s * (anti_reach + GAP + 1.5)
+        if bulk_lead:
+            cv.runs(lx, my - LABEL_CLEAR - _name_below(), nm, anchor, owner=_own)
+            cv.runs(lx, my + LABEL_CLEAR + LABEL_ASCENT, val_runs, anchor,
+                    owner=_own)
+        else:
+            cv.runs(lx, my - LABEL_GAP / 2.0 - _name_below(), nm, anchor,
+                    owner=_own)
+            cv.runs(lx, my + LABEL_GAP / 2.0 + LABEL_ASCENT, val_runs, anchor,
+                    owner=_own)
+    else:
+        # A bulk lead leaving the labels' side at the body's midpoint
+        # would run through them; they step aside to its right -- and
+        # below its run under the row, when that is where it goes.
+        lx, anchor = (mx + LABEL_CLEAR, "start") if bulk_lead else (mx, "middle")
+        if plan["gate"]["side"] == "U":
+            # name under the body, value under the name
+            ny = my + anti_reach + GAP + LABEL_ASCENT
+            if bulk_lead and plan["bulk"]["route"] == "under":
+                ny = my + MOS_UNDER + STROKE / 2.0 + LABEL_CLEAR + LABEL_ASCENT
+            cv.runs(lx, ny, nm, anchor, owner=_own)
+            cv.runs(lx, ny + _name_below() + LABEL_GAP + LABEL_ASCENT,
+                    val_runs, anchor, owner=_own)
+        elif bulk_lead and plan["bulk"]["route"] == "over_rail":
+            # gate down and the bulk over the top to the rail: the
+            # upper side is taken by that run and the right by its
+            # drop, so the labels go under the body, left of the gate's
+            # drop
+            ny = my + MOS_GATE_REACH + GAP + LABEL_ASCENT
+            cv.runs(mx - LABEL_CLEAR, ny, nm, "end", owner=_own)
+            cv.runs(mx - LABEL_CLEAR, ny + _name_below() + LABEL_GAP + LABEL_ASCENT,
+                    val_runs, "end", owner=_own)
+        else:
+            # gate down: the usual placement, value above the body and
+            # the name above the value
+            vy = my - anti_reach - GAP - LABEL_DESCENT
+            cv.runs(lx, vy, val_runs, anchor, owner=_own)
+            cv.runs(lx, vy - LABEL_ASCENT - LABEL_GAP - _name_below(), nm,
+                    anchor, owner=_own)
+
+    grounds: List[float] = []
+    g_term = at(mid, -(MOS_JOG + MOS_GAP + MOS_GATE_LEAD))
+    grounds += _route_mos_lead(cv, lay, plan["gate"], g_term, vertical, my)
+    if bulk_lead:
+        b_term = at(mid, MOS_BULK_OUT)
+        grounds += _route_mos_lead(cv, lay, plan["bulk"], b_term, vertical, my,
+                                   axis_end=at(mid + MOS_CH / 2.0, 0.0))
+    return grounds
+
+
+def _route_mos_lead(cv: _Canvas, lay: "_Layout", lead: dict,
+                    term: Tuple[float, float], vertical: bool, y_axis: float,
+                    axis_end: Optional[Tuple[float, float]] = None) -> List[float]:
+    """Wire one side lead from its terminal point to its node by the
+    route the layout chose (see the notes at `_Layout._plan_mosfets`).
+    Returns the x positions it put on the ground rail."""
+    x_t, y_t = term
+    node, route = lead["node"], lead["route"]
+    x_g = lay.px(lead["target_col"]) if "target_col" in lead else None
+    if vertical:
+        x_s = lay.px(lead["col"])
+        cv.wire(x_t, y_t, x_s, y_t)
+        if route == "rail":
+            cv.wire(x_s, y_t, x_s, lay.y_bot)
+            return [x_s]
+        if route == "stub":
+            y_r = lay.row_y(node)
+            cv.wire(x_s, y_t, x_s, y_r)
+            cv.wire(x_s, y_r, x_g, y_r)
+            return []
+        y_l = lay.lane_y(node)
+        cv.wire(x_s, y_t, x_s, y_l)
+        cv.wire(x_s, y_l, x_g, y_l)
+        cv.wire(x_g, y_l, x_g, lay.row_y(node))
+        return []
+    if route == "rail":
+        cv.wire(x_t, y_t, x_t, lay.y_bot)
+        return [x_t]
+    if route == "lane":
+        y_l = lay.lane_y(node)
+        cv.wire(x_t, y_t, x_t, y_l)
+        cv.wire(x_t, y_l, x_g, y_l)
+        cv.wire(x_g, y_l, x_g, lay.row_y(node))
+        return []
+    if route == "under":
+        # Under the row to the node's column, as an op-amp's lower input
+        # goes (#337): a tee onto whatever hangs there, above its body,
+        # or up to the row when nothing does. The tee lands on an
+        # element's lead, which `_flush_wires` does not dot by itself.
+        y_u = y_axis + MOS_UNDER
+        cv.wire(x_t, y_t, x_t, y_u)
+        cv.wire(x_t, y_u, x_g, y_u)
+        if lead["target_col"] in lay.elem_col.values():
+            cv.dot(x_g, y_u)
+        else:
+            cv.wire(x_g, y_u, x_g, lay.row_y(node))
+        return []
+    # "over_rail": a grounded bulk whose gate is grounded too, so both
+    # want the underside. The bulk goes over instead: out, along past
+    # the source end, and down across the source lead (a hop) to the
+    # rail. Rare, and drawn honestly rather than well.
+    x_d = axis_end[0] + 12.0 if axis_end else x_t + MOS_CH / 2.0 + 12.0
+    y_o = y_t - 12.0
+    cv.wire(x_t, y_t, x_t, y_o)
+    cv.wire(x_t, y_o, x_d, y_o)
+    cv.wire(x_d, y_o, x_d, lay.y_bot)
+    return [x_d]
+
+
 # --- layout ---------------------------------------------------------
 
 def _node_order(elements: List[Element]) -> List[str]:
@@ -1857,6 +2210,12 @@ def _node_order(elements: List[Element]) -> List[str]:
             note(e.n2)
         elif e.kind == "o":
             for n in e.fields[:3]:
+                note(n)
+        elif e.kind in MOS_KINDS:
+            # Fork: gate first. The gate is the input, and a walk that
+            # starts from it puts the input on the left, where a book
+            # puts it -- `m1 d in 0 0` alone still draws in, then d.
+            for n in (e.gate, e.n1, e.n2, e.bulk):
                 note(n)
         elif e.kind != "m":
             # a port element's terminals: two, or four (#314)
@@ -1898,6 +2257,18 @@ def _node_order(elements: List[Element]) -> List[str]:
             link(tr, br)
         elif e.kind not in ("m", "o"):
             link(e.n1, e.n2)
+    # Fork: a MOSFET's channel is the edge above (n1 is its drain, n2
+    # its source). Its gate, and a bulk wired elsewhere, are weaker
+    # links to whichever end of the channel is live, walked after the
+    # channel edges: a gate node reached this way lands beside the
+    # transistor, where its lead can join it along the node row rather
+    # than by a lane over the top (see `_Layout._plan_mosfets`).
+    for e in elements:
+        if e.kind in MOS_KINDS:
+            home = e.n1 if e.n1 != "0" else e.n2
+            link(e.gate, home)
+            if e.bulk != e.n2:
+                link(e.bulk, home)
 
     # An op-amp's output node must land to the *right* of its inverting
     # input, or the triangle is drawn backwards with its output wire
@@ -2283,6 +2654,17 @@ class _Layout:
         self.op_lane: Dict[str, int] = {}       # op-amps
         self.block_lane: Dict[str, int] = {}    # four-terminal blocks (#321)
         self.max_block_lane = 0
+        # Fork: the MOSFETs' plans -- see `_plan_mosfets`. `mos_cols`
+        # is (name, side) -> column: "L"/"R" a vertical transistor's
+        # side columns, "C" a horizontal one's own column. `lanes` is
+        # node -> (lane index, level it runs above, tall), `risers` the
+        # columns a lane's leads climb or drop through and the levels
+        # they cross, for `_clear_of_risers`.
+        self.mos: Dict[str, dict] = {}
+        self.mos_cols: Dict[Tuple[str, str], int] = {}
+        self.lanes: Dict[str, Tuple[int, int, bool]] = {}
+        self.risers: List[Tuple[int, int, int]] = []
+        self.lane_depth = 0.0
         self._assign()
         self.lift: Dict[str, float] = self._lifted_nodes()
 
@@ -2528,29 +2910,58 @@ class _Layout:
                         spacer_after[lo - 1] = max(spacer_after.get(lo - 1, 0), 1)
                     spacer_after[hi] = max(spacer_after.get(hi, 0), 1)
 
+        # Fork: which side columns each MOSFET wants, decided before the
+        # columns are numbered so they can be laid right beside it.
+        mos_sides, mos_between = self._plan_mosfets(idx_of, at_node, pre,
+                                                    extra, post)
+
         col = lead_spacer
         own_col: List[Tuple[str, Element]] = []   # (node, elem) pairs
         # The spacer columns after each node index, in order -- the
         # return leads of a four-terminal block rise through these.
         spacer_cols: Dict[int, List[int]] = {}
+
+        def side_col(e: Element, side: str, col: int) -> int:
+            """Fork: a MOSFET's side column, if it asked for one."""
+            if side in mos_sides.get(e.name, ()):
+                self.mos_cols[(e.name, side)] = col
+                col += 1
+            return col
+
+        first_at = {n: e for n, e in at_node}
         for i, n in enumerate(order):
             for e in pre.get(i, []):
+                col = side_col(e, "L", col)
                 self.elem_col[e.name] = col
                 own_col.append((_ground_node(e), e))
                 col += 1
+                col = side_col(e, "R", col)
+            if n in first_at:
+                col = side_col(first_at[n], "L", col)
             self.node_col[n] = col
             col += 1
+            if n in first_at:
+                col = side_col(first_at[n], "R", col)
             for e in extra.get(i, []):
+                col = side_col(e, "L", col)
                 self.elem_col[e.name] = col
                 own_col.append((_ground_node(e), e))
                 col += 1
+                col = side_col(e, "R", col)
             for e in post.get(i, []):
+                col = side_col(e, "L", col)
                 self.elem_col[e.name] = col
                 own_col.append((_ground_node(e), e))
                 col += 1
+                col = side_col(e, "R", col)
             k = spacer_after.get(i, 0)
             spacer_cols[i] = list(range(col, col + k))
             col += k
+            # Fork: a horizontal MOSFET's own column, in the gap after
+            # the leftmost of its two nodes, past any spacer there.
+            for name in mos_between.get(i, []):
+                self.mos_cols[(name, "C")] = col
+                col += 1
         self.cols = max(col, 1)
 
         for n, e in at_node:
@@ -2560,6 +2971,9 @@ class _Layout:
         for n, e in own_col:
             a, b = self.node_col[n], self.elem_col[e.name]
             stubs.append((min(a, b), max(a, b), 0))
+        # Fork: a MOSFET lead that joins its node along the row is a
+        # stub there too, so nothing else sits on that stretch.
+        self._route_mosfets(stubs)
 
         # Where each four-terminal block's return leads rise: the last
         # spacer column before its left top, the first after its right
@@ -2621,7 +3035,12 @@ class _Layout:
         # inner one's endpoints (a shared node -- a junction) instead of
         # the inner element's risers slicing up through the outer one's
         # body.
-        spans.sort(key=lambda s: (s[1] - s[0], s[0]))
+        # Fork: of equal width, a horizontal MOSFET with a lead dropping
+        # from its underside -- a grounded gate, a grounded bulk -- goes
+        # first, so it takes the node row and the drop meets nothing on
+        # its way to the rail. Every other element keeps its order.
+        spans.sort(key=lambda s: (s[1] - s[0], self._mos_drop_rank(s[2]),
+                                  s[0]))
 
         # Width alone is not enough: an element whose endpoint column
         # sits exactly at another element's centre would send its riser
@@ -2637,6 +3056,17 @@ class _Layout:
                 for c in (lo_a, hi_a):
                     if lo_b < c < hi_b and 2 * c == lo_b + hi_b:
                         above.setdefault(eb.name, set()).add(ea.name)
+        # Fork: a lead dropping from a horizontal MOSFET's underside
+        # passes through the row below it at the transistor's own
+        # column, so anything spanning that column must sit above the
+        # transistor, never between it and the rail.
+        for lo_a, hi_a, ea in spans:
+            if not self._mos_drops(ea):
+                continue
+            c = self.mos_cols[(ea.name, "C")]
+            for lo_b, hi_b, eb in spans:
+                if eb.name != ea.name and lo_b < c < hi_b:
+                    above.setdefault(eb.name, set()).add(ea.name)
 
         # Kahn's walk over those constraints, keeping the width sort as
         # the tie-break; a cycle (mutual centre hits) falls back to the
@@ -2679,6 +3109,8 @@ class _Layout:
             self.level[e.name] = lvl
             placed.append((lo, hi, lvl))
         self.max_level = max(self.level.values(), default=0)
+        # Fork: the levels are known, so the lanes can be laid.
+        self._lane_mosfets()
         # What actually occupies the node row, for gap_free below.
         self.row0 = [(lo, hi) for lo, hi, l in placed
                      if l == 0 and hi > lo]
@@ -2811,6 +3243,321 @@ class _Layout:
             taken_b.append((lo, hi, lane))
         self.max_block_lane = max(self.block_lane.values(), default=0)
 
+    # --- fork: MOSFETs -------------------------------------------------
+    #
+    # A MOSFET is drawn with its channel as the element's own path --
+    # drain to source, vertical in the band when one of them is ground,
+    # horizontal on the row (or a lifted level) when both are live --
+    # exactly as a two-terminal element between the same nodes would be
+    # laid out. The gate, and a bulk wired anywhere but the source, are
+    # *side leads*: each leaves the body perpendicular to the channel
+    # and has to reach a node of its own. That is the op-amp's problem
+    # (three terminals, one body in the band), and it is solved the way
+    # the four-terminal block solved its return leads (#314): the
+    # transistor claims a clear column for each side lead, and the lead
+    # runs there and then to its node by the plainest route available:
+    #
+    #   * to **ground**: straight down that column to the rail;
+    #   * to a node **beside** it, nothing in between: up to the node
+    #     row and along it -- the stub a parallel ground column uses;
+    #   * to a node anywhere **else**: up to a lane above the node row
+    #     and along that to the node's column, then down onto the row.
+    #     Above, not below: below the row is where every hanging body
+    #     is. Leads bound for one node share the lane and merge into
+    #     one bus with a junction dot at each tap, which is how a book
+    #     draws a current mirror's gates; lanes to different nodes that
+    #     would overlap take separate lines a step apart.
+    #
+    # A horizontal transistor's gate is on its upper side, so the lane is
+    # its natural route; when the gate is ground the symbol turns over
+    # and the gate drops straight to the rail. An untied bulk takes the
+    # opposite side: for a vertical body the other side column; for a
+    # horizontal one the underside, to the rail or, for a live node,
+    # along a short lane under the row as an op-amp's lower input goes
+    # (#337). Which side the gate faces on a vertical body is Roberto's
+    # rule for every lead -- toward its destination -- and toward the
+    # free side (left, away from the labels) when that is ground or the
+    # transistor's own drain.
+
+    def _plan_mosfets(self, idx_of: Dict[str, int],
+                      at_node: List[Tuple[str, Element]],
+                      pre: Dict[int, List[Element]],
+                      extra: Dict[int, List[Element]],
+                      post: Dict[int, List[Element]]):
+        """Decide each MOSFET's orientation, each side lead's route and
+        which columns it needs, before the columns are numbered.
+        Returns (sides, between): `sides` maps a vertical transistor's
+        name to the side columns it claims, `between` maps a node index
+        to the horizontal transistors wanting a column of their own in
+        the gap after it.
+
+        Decided here, in node-order index space, because the choice of
+        side has to be made before the columns exist and the choice of
+        route decides the side. The price list (`_cost`) is the guide:
+        a crossing costs more than any number of bends. So a lead joins
+        its node along the row (a stub) only when the stub lifts
+        nothing -- the node is the neighbour, nothing hangs between,
+        and no element spans that gap -- and otherwise takes a lane,
+        rising on whichever side of the transistor has no element
+        spanning over it to be crossed on the way up: the near side
+        when it is clear, the far side when only that is, which is
+        Roberto's "toward its destination" yielding to "cross nothing".
+        (Drawn the other way round, t3's M1 lifted its neighbour and
+        the neighbour's gate then hopped over the stub.)"""
+        sides: Dict[str, set] = {}
+        between: Dict[int, List[str]] = {}
+        first_at = {n: e for n, e in at_node}
+        last = max(idx_of.values(), default=0)
+        # Every spanning element's interval of node indices.
+        span_idx: List[Tuple[int, int]] = []
+        for s in self.spanning:
+            if s.kind in PORT_BLOCK or s.kind == "t":
+                a, b = idx_of.get(_port_tops(s)[0]), idx_of.get(_port_tops(s)[1])
+            else:
+                a, b = idx_of.get(s.n1), idx_of.get(s.n2)
+            if a is not None and b is not None and a != b:
+                span_idx.append((min(a, b), max(a, b)))
+
+        def crosses(lo: int, hi: int) -> bool:
+            """Does any element span the gap(s) from node lo to node hi?"""
+            return any(a < hi and b > lo for a, b in span_idx)
+
+        # Nodes a horizontal transistor's own lane will run to. A lane
+        # shared with one runs above that transistor's level, so lifting
+        # an element from under a vertical body's riser would gain
+        # nothing there: the riser would cross the lifted element's lead
+        # on its way up instead (ring3, 11 crossings for 4).
+        lane_nodes_h = set()
+        for s in self.spanning:
+            if s.kind in MOS_KINDS:
+                lane_nodes_h.add(s.gate)
+                if s.bulk != s.n2:
+                    lane_nodes_h.add(s.bulk)
+
+        for e in self.grounded:
+            if e.kind not in MOS_KINDS:
+                continue
+            home = _ground_node(e)
+            i = idx_of.get(home)
+            if i is None:
+                continue
+            is_first = first_at.get(home) is e
+            extras, posts = extra.get(i, []), post.get(i, [])
+            # Nothing of this node's between the transistor and the gap
+            # on its right; on its left, the same. A parallel column's
+            # stub runs along the row over everything of the node's
+            # that lies right of it.
+            right_free = ((is_first and not extras and not posts)
+                          or (extras and e is extras[-1] and not posts)
+                          or (posts and e is posts[-1]))
+            left_free = is_first and not pre.get(i)
+            # Is the row above a side column clear, so a lead can rise
+            # through it to a lane crossing nothing? For the element at
+            # the node it is the neighbouring gap that decides -- and its
+            # own extras' stubs pass over its right side. A parallel
+            # column's stub passes over the left side of every extra,
+            # and the next extra's over its right. A gap that is not
+            # clear only because an element *spans* it can be cleared:
+            # the riser registers a stub there and the element lifts
+            # (`lift` below) -- bends, where a crossing would cost more.
+            hanging_here = not is_first
+
+            def gap_clear(side: str) -> bool:
+                if hanging_here:
+                    return side == "R" and right_free
+                if side == "L":
+                    return i == 0 or not crosses(i - 1, i)
+                return (i == last or not crosses(i, i + 1)) and not extras \
+                    and not posts
+
+            def liftable(side: str) -> bool:
+                if hanging_here:
+                    return False
+                if side == "L":
+                    return i > 0 and crosses(i - 1, i)
+                return not extras and not posts and i < last \
+                    and crosses(i, i + 1)
+
+            def decide(node: str, taken: Optional[str]) -> Tuple[str, str]:
+                """(side, route) for a lead to `node`; `taken` is the
+                side the other lead already has."""
+                free = [s for s in ("L", "R") if s != taken]
+                if node == "0":
+                    return free[0], "rail"
+                if node == home:
+                    # back to the transistor's own drain: a loop on
+                    # whichever side has nothing spanning to lift
+                    for s in free:
+                        if s == "L" and (hanging_here or i == 0
+                                         or not crosses(i - 1, i)):
+                            return "L", "stub"
+                        if s == "R" and right_free and (
+                                i == last or not crosses(i, i + 1)):
+                            return "R", "stub"
+                    return free[0], "stub"
+                ni = idx_of.get(node)
+                if ni is None:
+                    return free[0], "lane"
+                if "L" in free and ni == i - 1 and left_free \
+                        and not extra.get(ni) and not post.get(ni) \
+                        and not crosses(ni, i):
+                    return "L", "stub"
+                if "R" in free and ni == i + 1 and right_free \
+                        and not pre.get(ni) and not crosses(i, ni):
+                    return "R", "stub"
+                near = "L" if ni < i else "R"
+                far = "R" if near == "L" else "L"
+                for s in (near, far):
+                    if s in free and gap_clear(s):
+                        return s, "lane"
+                if node not in lane_nodes_h:
+                    for s in (near, far):
+                        if s in free and liftable(s):
+                            return s, "lane-lift"
+                return (near if near in free else far), "lane"
+
+            def lead_plan(node: str, taken: Optional[str]) -> dict:
+                side, route = decide(node, taken)
+                lift = route == "lane-lift"
+                return {"node": node, "side": side,
+                        "route": "lane" if lift else route, "lift": lift}
+
+            plan = {"vertical": True, "tied": e.bulk == e.n2,
+                    "gate": lead_plan(e.gate, None), "bulk": None}
+            sides[e.name] = {plan["gate"]["side"]}
+            if not plan["tied"]:
+                plan["bulk"] = lead_plan(e.bulk, plan["gate"]["side"])
+                sides[e.name].add(plan["bulk"]["side"])
+            self.mos[e.name] = plan
+        for e in self.spanning:
+            if e.kind not in MOS_KINDS:
+                continue
+            a, b = idx_of.get(e.n1), idx_of.get(e.n2)
+            if a is None or b is None:
+                continue
+            g = e.gate
+            gside = "D" if g == "0" else "U"
+            plan = {"vertical": False, "tied": e.bulk == e.n2,
+                    "gate": {"node": g, "side": gside}, "bulk": None}
+            if not plan["tied"]:
+                plan["bulk"] = {"node": e.bulk,
+                                "side": "U" if gside == "D" else "D"}
+            between.setdefault(min(a, b), []).append(e.name)
+            self.mos[e.name] = plan
+        return sides, between
+
+    def _route_mosfets(self, stubs: List[Tuple[int, int, int]]) -> None:
+        """With the columns numbered, give each side lead its columns --
+        the one it runs in and the one it is bound for -- register the
+        stubs on the node row, and choose a horizontal transistor's
+        routes: rail, lane or under."""
+        for e in self.elements:
+            plan = self.mos.get(e.name)
+            if plan is None:
+                continue
+            for which in ("gate", "bulk"):
+                lead = plan[which]
+                if lead is None:
+                    continue
+                node = lead["node"]
+                if plan["vertical"]:
+                    lead["col"] = self.mos_cols[(e.name, lead["side"])]
+                    if node == "0":
+                        continue
+                    home = _ground_node(e)
+                    lead["target_col"] = (self.elem_col[e.name] if node == home
+                                          else self.node_col[node])
+                    if lead["route"] == "stub":
+                        lo = min(lead["col"], lead["target_col"])
+                        hi = max(lead["col"], lead["target_col"])
+                        stubs.append((lo, hi, 0))
+                    elif lead.get("lift"):
+                        # a stub one column either side: exactly the
+                        # spans that strictly contain the riser's column
+                        # conflict with it, and they lift off the row
+                        c = lead["col"]
+                        stubs.append((c - 1, c + 1, 0))
+                else:
+                    lead["col"] = self.mos_cols[(e.name, "C")]
+                    if node != "0":
+                        lead["target_col"] = self.node_col[node]
+                    if lead["side"] == "D":
+                        lead["route"] = "rail" if node == "0" else "under"
+                    else:
+                        lead["route"] = "over_rail" if node == "0" else "lane"
+
+    def _mos_drops(self, e: Element) -> bool:
+        """Does this horizontal MOSFET drop a lead through the row
+        beneath it -- to the rail, or under the row to a live node?"""
+        plan = self.mos.get(e.name)
+        if plan is None or plan["vertical"]:
+            return False
+        return any(lead is not None and lead["side"] == "D"
+                   for lead in (plan["gate"], plan["bulk"]))
+
+    def _mos_drop_rank(self, e: Element) -> int:
+        return 0 if self._mos_drops(e) else 1
+
+    def _lane_mosfets(self) -> None:
+        """Lay the lanes: one per node that lane-routed leads run to,
+        coloured so that two lanes over the same stretch of row never
+        share a line. A lane runs above the highest level any of its
+        leads leaves from, and stands taller when another element on
+        that level has its labels under the lane's run."""
+        groups: Dict[str, dict] = {}
+        for e in self.elements:
+            plan = self.mos.get(e.name)
+            if plan is None:
+                continue
+            lvl = 0 if plan["vertical"] else self.level.get(e.name, 0)
+            for lead in (plan["gate"], plan["bulk"]):
+                if lead is None or lead.get("route") != "lane":
+                    continue
+                g = groups.setdefault(lead["node"], {"cols": set(), "top": 0,
+                                                     "members": []})
+                g["cols"].update((lead["col"], lead["target_col"]))
+                g["top"] = max(g["top"], lvl)
+                g["members"].append((e.name, lead["col"], lvl))
+        if not groups:
+            return
+        taken: List[Tuple[int, int, int, int]] = []    # lo, hi, top, k
+        for node in sorted(groups, key=lambda n: min(groups[n]["cols"])):
+            g = groups[node]
+            lo, hi, top = min(g["cols"]), max(g["cols"]), g["top"]
+            k = 0
+            while any(t == top and kk == k and min(hi, h) > max(lo, o)
+                      for o, h, t, kk in taken):
+                k += 1
+            taken.append((lo, hi, top, k))
+            # Tall when another element on the lane's level spans into
+            # its run -- its labels stand above its body, where a short
+            # lane would cut through them.
+            names = {m[0] for m in g["members"]}
+            tall = False
+            for other in self.spanning:
+                if other.name in names or self.level.get(other.name, 0) != top:
+                    continue
+                oa = self.node_col.get(other.n1)
+                ob = self.node_col.get(other.n2)
+                if oa is None or ob is None:
+                    continue
+                if min(oa, ob) < hi and max(oa, ob) > lo:
+                    tall = True
+                    break
+            self.lanes[node] = (k, top, tall)
+            height = (GATE_LANE_TALL if tall else GATE_LANE) + k * GATE_LANE_STEP
+            self.lane_depth = max(self.lane_depth, height)
+            for name, col, lvl in g["members"]:
+                self.risers.append((col, lvl, top))
+                self.risers.append((self.node_col[node]
+                                    if node in self.node_col else col, 0, top))
+
+    def lane_y(self, node: str) -> float:
+        """Where the lane to `node` runs."""
+        k, top, tall = self.lanes[node]
+        return (self.y_top - top * self.stack_h
+                - (GATE_LANE_TALL if tall else GATE_LANE) - k * GATE_LANE_STEP)
+
     def return_col(self, e: Element, node: str) -> Optional[int]:
         """The spacer column through which a four-terminal block's lead
         to bottom node `node` rises: the one on the side of the block
@@ -2923,7 +3670,14 @@ class _Layout:
         carries a current arrow, which hangs `_mark_stack()` further
         down than anything the plain number was measured against."""
         lifted = any(self.level.get(n, 0) > 0 for n in self.i_ref)
-        return STACK_H + (_mark_stack() if lifted else 0.0)
+        h = STACK_H + (_mark_stack() if lifted else 0.0)
+        # Fork: a MOSFET lane runs above the row of the level it
+        # serves, and the level above that hangs its labels down; the
+        # stack grows so the two never meet. Nothing changes for a
+        # drawing without a lane.
+        if self.lane_depth:
+            h = max(h, self.lane_depth + GATE_LANE_CLEAR)
+        return h
 
     @property
     def y_top(self) -> float:
@@ -4178,6 +4932,20 @@ def _render_once(elements: List[Element], marks=None,
             # input pin where that node was lifted to meet it (#377).
             cv.wire(xa, lay.row_y(e.n1), xa, y)
             cv.wire(xb, lay.row_y(e.n2), xb, y)
+        if e.kind in MOS_KINDS:
+            # Fork: the body sits on a fixed stretch centred on the
+            # transistor's own column, where its side leads leave, and
+            # plain wire runs from there to its two nodes.
+            xc = lay.px(lay.mos_cols[(e.name, "C")])
+            lo, hi = xc - MOS_STRETCH / 2.0, xc + MOS_STRETCH / 2.0
+            if lo > min(xa, xb):
+                cv.wire(min(xa, xb), y, lo, y)
+            if hi < max(xa, xb):
+                cv.wire(hi, y, max(xa, xb), y)
+            x1, x2 = (lo, hi) if xa <= xb else (hi, lo)
+            ground_x += _draw_mosfet(cv, lay, e, x1, y, x2, y)
+            segs[e.name] = (x1, y, x2, y)
+            continue
         # The body sits in the widest stretch of its span that no higher
         # branch's riser climbs through. Centred on the whole span, as it
         # always was, it lands on any riser that happens to rise from the
@@ -4218,11 +4986,14 @@ def _render_once(elements: List[Element], marks=None,
             segs[e.name] = (x, y_foot, x, y_row)
         else:
             segs[e.name] = (x, y_row, x, y_foot)
-        _draw_element(cv, e, *segs[e.name],
-                      dependent=e.name in lay.controlled,
-                      mark_v=e.name in lay.v_ref,
-                      mark_i=e.name in lay.i_ref,
-                      refs=lay.refs)
+        if e.kind in MOS_KINDS:                 # fork
+            ground_x += _draw_mosfet(cv, lay, e, *segs[e.name])
+        else:
+            _draw_element(cv, e, *segs[e.name],
+                          dependent=e.name in lay.controlled,
+                          mark_v=e.name in lay.v_ref,
+                          mark_i=e.name in lay.i_ref,
+                          refs=lay.refs)
         ground_x.append(x)
 
     # 3. op-amps, before the rail is sized: a grounded non-inverting
@@ -4489,6 +5260,13 @@ def _clear_of_risers(lay: "_Layout", e: Element, lvl: int,
             col = lay.node_col.get(node)
             if col is None:
                 continue
+            x = lay.px(col)
+            if lo + 0.5 < x < hi - 0.5:
+                cuts.append(x)
+    # Fork: a MOSFET lead climbing to a lane above this level, or
+    # dropping from one onto the row, crosses this level too.
+    for col, from_lvl, top in lay.risers:
+        if from_lvl < lvl <= top:
             x = lay.px(col)
             if lo + 0.5 < x < hi - 0.5:
                 cuts.append(x)
@@ -5024,3 +5802,41 @@ def draw(desc: str):
 #   is therefore drawn as a diamond -- correctly, since that is what it
 #   solves as, but it can surprise someone who meant `vs` as a free
 #   parameter and did not notice the collision.
+#
+# Fork (the nonlinear devices; 16 Sep 2026). Every one of ahkab's 23
+# test netlists with a diode, a MOSFET or a switch draws, and the
+# drawer's own `_collisions` reports no hard fault on any of them, but:
+# * A MOSFET's channel takes the place a two-terminal element would,
+#   so a transistor with both drain and source live lies **on its
+#   side** along the node row (t2, rout, ekv1), which is not how a
+#   book stands a common-source stage. Standing every transistor up
+#   would need its source to leave the band and return to the row,
+#   the op-amp's under-run, on every such transistor; the row layout
+#   was kept and the symbol turned instead.
+# * A gate or bulk lead that cannot join its node beside the
+#   transistor runs along a lane above the row and drops onto the
+#   node's column. That lane crosses whatever rises through it -- a
+#   lifted branch's riser, another lane's drop -- with a hop, and a
+#   circuit whose gates all cross each other's channels (the ring
+#   oscillators ring3 and ring3mosq: 4 hops; the differential pair
+#   shooting/diffamp: 15, most of them its own resistor ladder's)
+#   comes out honest and busy rather than readable. No attempt is made
+#   to reorder the nodes for the gates' sake beyond the weak link
+#   `_node_order` adds; a search over orders is where the next gain
+#   is, and it is the search `_render` already runs for op-amps.
+# * A horizontal transistor's bulk wired to a live node other than its
+#   source runs under the row to that node, crossing every hanging
+#   lead between (hand_nmos_bulk_node: 2 hops). A grounded bulk on a
+#   transistor whose gate is grounded too goes over the top and down
+#   across its own source lead. Neither occurs in ahkab's tests.
+# * A lifted horizontal transistor with a grounded gate drops its gate
+#   through the row beneath it; the level sort puts such a transistor
+#   on the row first, so this only happens when two of them are in
+#   parallel, and then the drop crosses whatever is on the row.
+# * The symbols are not Nilsson & Riedel's, who draw none of these.
+#   The MOSFET is the four-terminal symbol with its bulk arrow as the
+#   only channel-type mark, the bulk stub joined to the source when
+#   the two are one node; the diode an open triangle and bar; the
+#   switch a blade hinged at n1. Their sizes stand in the book's
+#   proportion to the symbols that are measured, and are Roberto's
+#   to move.

@@ -100,6 +100,7 @@ E_M_NOT_IMAGINARY     = 225   # #438: ohms: positive imaginary
 E_M_K_RANGE           = 226   # #438: 0 < k <= 1
 E_M_TOO_STRONG        = 227   # #438: M above sqrt(L1*L2)
 E_M_IMPEDANCE_DOMAIN  = 228   # #438: a pair in ohms couples in AC only
+E_TERMS_WITH_LABEL    = 229   # fork: d/n/p/w, with or without a last term
 
 # --- 3xx: engine.py ---------------------------------------------------
 E_NO_STAMPING_RULE    = 301
@@ -254,6 +255,12 @@ CATALOGUE = {
                     "Your description of element '%{name}' has %{got} "
                     "terms. Exactly %{expected} terms are expected for an "
                     "element of type '%{kind}'."),
+    E_TERMS_WITH_LABEL: ("error",
+                         "Your description of element '%{name}' has %{got} "
+                         "terms. %{expected} or %{expected_label} (with a "
+                         "label, or a switch's control, as the last term) "
+                         "terms are expected for an element of type "
+                         "'%{kind}'."),
     E_TWOPORT_LAST_TERM: ("error",
                           "The last term of two-port '%{name}' is "
                           "'%{shown}'. A two-port's parameters are written "
