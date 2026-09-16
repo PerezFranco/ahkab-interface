@@ -489,9 +489,16 @@ SUB_DY = 2.9         # how far its baseline drops, px
 
 
 def _split_name(name: str) -> Tuple[str, str]:
-    """`r1` -> ('R', '1'), `vin` -> ('V', 'IN'), `r_a` -> ('R', 'A')."""
+    """`r1` -> ('R', '1'), `vin` -> ('V', 'IN'), `r_a` -> ('R', 'A').
+
+    Fork change: a name translated from an ahkab netlist is written as
+    the Symbulator kind letter, a double underscore, and the ahkab name
+    (`e__v1`, `j__f1`, `r__rl`), and it is shown by the ahkab name alone
+    (V1, F1, RL), so the drawing matches the netlist and the results."""
     if not name:
         return "", ""
+    if len(name) > 3 and name[1:3] == "__":
+        name = name[3:]
     return name[0].upper(), name[1:].lstrip("_").replace("_", "").upper()
 
 
