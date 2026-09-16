@@ -31,10 +31,21 @@ Every netlist in `examples/` is copied unchanged from ahkab's own test suite
 (`tests/` in the ahkab repository), by Giuseppe Venturini and contributors,
 GPL-2.0.
 
+## Circuit drawings
+
+`schematic/` is a fork of the schematic generator from Symbulator, by Roberto
+Perez-Franco: `schematic.py`, `elements.py`, `messages.py` and `si_prefix.py`,
+copied from Symbulator's solver at commit `5d1c52f`. The original code is
+© 1999–2026 Roberto Perez-Franco under the MIT License, whose text is kept in
+`schematic/LICENSE-MIT`. The fork, including its changes, is distributed under
+the GNU General Public License, version 2 or (at your option) any later
+version. Each file's header records where it came from.
+
 ## The interface
 
 Everything else in this repository — `index.html`, `app.js`, `chart.js`,
-`worker.js`, `engine.py`, `style.css`, `tests/`, `tools/` — is © 2026 Roberto
+`worker.js`, `engine.py`, `netlist_schematic.py`, `style.css`, `tests/`,
+`tools/` — is © 2026 Roberto
 Perez-Franco, free software under the GNU General Public License, version 2 or
 (at your option) any later version. See `COPYING`.
 

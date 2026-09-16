@@ -2,8 +2,8 @@
 
 A web page for simulating circuits with **ahkab**, the SPICE-like circuit
 simulator by Giuseppe Venturini. Write or paste an ahkab netlist, press Run,
-and see the operating point, sweeps, transients, AC responses, poles and zeros,
-and symbolic results as tables and charts.
+and see the circuit drawn, then its operating point, sweeps, transients, AC
+responses, poles and zeros, and symbolic results as tables and charts.
 
 Python runs in the visitor's browser through [Pyodide](https://pyodide.org). The
 server only serves static files, and nothing typed into the page leaves the
@@ -50,6 +50,8 @@ Builds from the sibling `..\ahkab` clone and records the commit in
 | `chart.js` | SVG line charts with a hover readout |
 | `worker.js` | Web Worker: loads Pyodide and ahkab, runs circuits |
 | `engine.py` | Python: runs ahkab and turns its results into plain data |
+| `netlist_schematic.py` | Python: translates the parsed circuit for the drawing |
+| `schematic/` | the schematic generator, forked from Symbulator (see `NOTICE.md`) |
 | `examples/` | netlists from ahkab's own test suite |
 | `vendor/` | the ahkab and tabulate wheels |
 
@@ -60,8 +62,8 @@ finish waits for them.
 
 ## Before publishing
 
-- [ ] The ahkab source the page ships must be publicly available: push the
-      `lazy-imports` branch of the fork, or wait until it is merged.
+- [x] The ahkab source the page ships must be publicly available: the
+      `lazy-imports` branch of the fork was pushed on 16 Sep 2026.
 - [ ] Publish this repository and link its source from the page footer.
 - [ ] Check PythonAnywhere's static-file hosting details at the time.
 
