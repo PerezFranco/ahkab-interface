@@ -20,8 +20,7 @@ Changes made in 2026 by Roberto Perez-Franco, relative to upstream `master`
 3. Port the test suite off nose — ahkab/ahkab#86
 4. Support NumPy 2 — ahkab/ahkab#87
 5. Fix unicode output on Windows — ahkab/ahkab#88
-6. Import SymPy and scipy.signal only when they are needed — branch
-   `lazy-imports`, not yet submitted
+6. Import SymPy and scipy.signal only when they are needed — ahkab/ahkab#90
 
 Each change's reasoning is in its commit message on the fork.
 
