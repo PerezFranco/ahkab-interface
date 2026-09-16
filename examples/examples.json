@@ -1,0 +1,13 @@
+{
+  "note": "Every netlist here is copied unchanged from ahkab's own test suite (ahkab/tests), by Giuseppe Venturini and contributors, GPL-2.0-only.",
+  "examples": [
+    {"file": "ohms_law.ckt",         "title": "Ohm's law",                        "analyses": "operating point",               "from": "tests/ohms_law/ohms_law.ckt"},
+    {"file": "dc_sweep.ckt",         "title": "Voltage divider, DC sweep",         "analyses": "operating point, DC sweep",     "from": "tests/rtest1/rtest1.ckt"},
+    {"file": "series_resonance.ckt", "title": "Series RLC resonance",              "analyses": "operating point, AC, symbolic", "from": "tests/series_resonance/series_resonance.ckt"},
+    {"file": "rlc_pulse.ckt",        "title": "RLC circuit, pulse response",       "analyses": "operating point, transient",    "from": "tests/tran_trap/tran_trap.ckt"},
+    {"file": "mosfet_op.ckt",        "title": "MOSFET with resistor load",         "analyses": "operating point",               "from": "tests/t1/t1.ckt"},
+    {"file": "diode_op.ckt",         "title": "Diode with series resistor",        "analyses": "operating point",               "from": "tests/diode_op/diode_op.ckt"},
+    {"file": "lowpass_pz.ckt",       "title": "5th-order low-pass filter",         "analyses": "operating point, poles and zeros", "from": "tests/pz_spice/pz_spice1.ckt"},
+    {"file": "sine_fft.ckt",         "title": "Sine source, FFT",                  "analyses": "transient, FFT",                "from": "tests/fft_ckt/fft_ckt.ckt"}
+  ]
+}

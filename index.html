@@ -1,0 +1,62 @@
+<!doctype html>
+<!--
+  An interface for ahkab.
+  Copyright 2026 Roberto Perez-Franco
+  SPDX-License-Identifier: GPL-2.0-or-later
+
+  Simulation engine: ahkab, by Giuseppe Venturini (GPL-2.0).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>An interface for ahkab</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>An interface for ahkab</h1>
+    <p class="engine">Simulation engine: <a href="https://github.com/ahkab/ahkab">ahkab</a>, by Giuseppe Venturini</p>
+  </div>
+  <div class="statuses" aria-live="polite">
+    <span class="status" id="status" data-state="loading"><span class="dot" aria-hidden="true"></span><span id="status-text">Starting…</span></span>
+    <span class="status" id="deferred" data-state="waiting"><span class="dot" aria-hidden="true"></span><span id="deferred-text">Symbolic and FFT tools: waiting</span></span>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="editor-pane" aria-label="Netlist">
+    <label for="example" class="field-label">Example</label>
+    <select id="example"></select>
+    <label for="netlist" class="field-label">Netlist <span class="muted">(ahkab syntax)</span></label>
+    <textarea id="netlist" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+    <div class="actions">
+      <button id="run" disabled>Run</button>
+      <span class="muted small">Ctrl+Enter</span>
+    </div>
+    <p class="muted small help">
+      Syntax reference:
+      <a href="https://ahkab.readthedocs.io/en/latest/help/Netlist-Syntax.html">ahkab netlists</a>.
+      It resembles SPICE, but sources are written <code>type=vdc vdc=5</code>, not <code>DC 5</code>.
+    </p>
+  </section>
+
+  <section class="results-pane" id="results" aria-live="polite">
+    <p class="muted placeholder">Results appear here. Pick an example or write a netlist, then press Run.</p>
+  </section>
+</main>
+
+<footer class="bottom">
+  <p>
+    <strong>ahkab</strong> © 2006–2015 Giuseppe Venturini and contributors, GPL-2.0.
+    This page ships a modified ahkab with compatibility fixes; see <a href="NOTICE.md">NOTICE</a>.
+  </p>
+  <p>
+    Interface © 2026 Roberto Perez-Franco, free software under the GNU GPL, version 2 or later (<a href="COPYING">COPYING</a>).
+    Runs Python in your browser with <a href="https://pyodide.org">Pyodide</a>; nothing you enter is sent to a server.
+  </p>
+</footer>
+</body>
+</html>

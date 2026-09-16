@@ -1,0 +1,4 @@
+ahkab wheel built from https://github.com/PerezFranco/ahkab
+branch: lazy-imports
+commit: db96625cb31b18fcad91b431ec31b4c1f3f04b87
+built:  2026-09-16T10:42:10Z
