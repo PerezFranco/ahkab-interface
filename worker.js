@@ -19,6 +19,9 @@ import { loadPyodide } from 'https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyod
 
 const PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v314.0.7/full/';
 const WHEELS = ['tabulate-0.10.0-py3-none-any.whl', 'ahkab-0.18-py3-none-any.whl'];
+// Python modules served as plain files beside the page.
+const MODULES = ['engine.py', 'netlist_schematic.py', 'schematic/__init__.py',
+  'schematic/schematic.py', 'schematic/elements.py', 'schematic/messages.py', 'schematic/si_prefix.py'];
 const HOME = '/opt/interface';
 
 
@@ -75,7 +78,10 @@ self.onmessage = (event) => {
     for (const wheel of WHEELS) {
       pyodide.FS.writeFile(HOME + '/wheels/' + wheel, await fetchBytes('vendor/' + wheel));
     }
-    pyodide.FS.writeFile(HOME + '/engine.py', await fetchBytes('engine.py'));
+    pyodide.FS.mkdirTree(HOME + '/schematic');
+    await Promise.all(MODULES.map(async (path) => {
+      pyodide.FS.writeFile(HOME + '/' + path, await fetchBytes(path));
+    }));
     const list = WHEELS.map((w) => "'emfs:" + HOME + '/wheels/' + w + "'").join(', ');
     await pyodide.runPythonAsync('import micropip\nawait micropip.install([' + list + '], deps=False)');
     pyodide.runPython("import sys\nif '" + HOME + "' not in sys.path: sys.path.insert(0, '" + HOME + "')");

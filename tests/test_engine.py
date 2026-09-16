@@ -185,3 +185,23 @@ def test_deferred_load_is_really_deferred():
 def test_run_json_is_strict_json():
     out = json.loads(engine.run_json(netlist('dc_sweep.ckt')))
     assert out['ok'] is True
+
+
+def test_results_carry_the_drawing():
+    res = run('dc_sweep.ckt')
+    assert res['schematic']['svg'].startswith('<svg')
+
+
+def test_a_drawing_problem_never_costs_the_simulation(monkeypatch):
+    import netlist_schematic
+    def broken(circ):
+        raise RuntimeError('layout exploded')
+    monkeypatch.setattr(netlist_schematic, 'draw', broken)
+    res = run('ohms_law.ckt')
+    assert res['ok'] is True
+    assert 'layout exploded' in res['schematic']['error']
+
+
+def test_no_drawing_for_a_netlist_that_does_not_parse():
+    res = engine.run('Pasted from SPICE\nVIN IN 0 AC 1\nR1 IN 0 1k\n.op\n')
+    assert res['ok'] is False and res['schematic'] is None

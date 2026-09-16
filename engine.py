@@ -66,7 +66,25 @@ def load_deferred():
     t0 = time.perf_counter()
     import sympy                 # noqa: F401  symbolic analysis
     import scipy.signal.windows  # noqa: F401  .fft windowing
+    import netlist_schematic     # noqa: F401  the drawing
+    from schematic import schematic  # noqa: F401
     return time.perf_counter() - t0
+
+
+def _draw(path):
+    """The circuit drawing for the netlist at ``path``, or None when the
+    netlist does not parse (the simulation reports that itself)."""
+    from ahkab import netlist_parser
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            circ, _, _ = netlist_parser.parse_circuit(path)
+    except Exception:
+        return None
+    try:
+        import netlist_schematic
+        return netlist_schematic.draw(circ)
+    except Exception as e:  # a drawing problem must never cost the simulation
+        return {'error': 'The drawing could not be made: %s: %s' % (type(e).__name__, e)}
 
 
 def _restore_options():
@@ -196,6 +214,7 @@ def run(netlist):
     path = os.path.join(workdir, 'circuit.ckt')
     with open(path, 'w', encoding='utf-8') as fp:
         fp.write(netlist if netlist.endswith('\n') else netlist + '\n')
+    drawing = _draw(path)
     out = io.StringIO()
     t0 = time.perf_counter()
     try:
@@ -203,6 +222,7 @@ def run(netlist):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
                 results = ahkab.main(path, outfile=os.path.join(workdir, 'out'), verbose=0)
         except netlist_parser.NetlistParseError as e:
+            drawing = None
             message = 'The netlist could not be read: %s' % e
             if 'unknown type' in str(e) and 'source' in str(e):
                 # The commonest cause: a source line pasted from SPICE.
@@ -211,11 +231,12 @@ def run(netlist):
                             'where SPICE writes "V1 1 0 DC 5" or "V1 1 0 AC 1".')
             return _failure('parse', message, out, t0, title)
         except circuit.CircuitError as e:
-            return _failure('circuit', 'The circuit is not valid: %s' % e, out, t0, title)
+            return _failure('circuit', 'The circuit is not valid: %s' % e, out, t0, title,
+                            drawing=drawing)
         except Exception as e:  # ahkab raises many kinds; report, don't crash
             return _failure('simulation', 'The simulation failed: %s: %s'
                             % (type(e).__name__, e), out, t0, title,
-                            detail=traceback.format_exc())
+                            detail=traceback.format_exc(), drawing=drawing)
         elapsed = time.perf_counter() - t0
         try:
             requests = {}
@@ -243,9 +264,9 @@ def run(netlist):
         except Exception as e:
             return _failure('display', 'The simulation ran, but its results could not be '
                             'prepared for display: %s: %s' % (type(e).__name__, e),
-                            out, t0, title, detail=traceback.format_exc())
+                            out, t0, title, detail=traceback.format_exc(), drawing=drawing)
         return {'ok': True, 'title': title, 'elapsed_s': elapsed,
-                'analyses': analyses, 'console': out.getvalue()}
+                'analyses': analyses, 'console': out.getvalue(), 'schematic': drawing}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -256,7 +277,7 @@ def run_json(netlist):
     return json.dumps(run(netlist), allow_nan=False)
 
 
-def _failure(kind, message, out, t0, title, detail=None):
+def _failure(kind, message, out, t0, title, detail=None, drawing=None):
     return {'ok': False, 'title': title, 'elapsed_s': time.perf_counter() - t0,
             'error': {'kind': kind, 'message': message, 'detail': detail},
-            'console': out.getvalue()}
+            'console': out.getvalue(), 'schematic': drawing}

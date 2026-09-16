@@ -128,6 +128,7 @@ function render(res, elapsedPage) {
       ? `${res.analyses.length} ${res.analyses.length === 1 ? 'analysis' : 'analyses'} · ${(elapsedPage / 1000).toFixed(2)} s`
       : `${(elapsedPage / 1000).toFixed(2)} s` }));
   results.appendChild(head);
+  if (res.schematic) results.appendChild(renderDrawing(res.schematic));
 
   if (!res.ok) {
     const box = h('div', { class: 'error', role: 'alert' },
@@ -147,6 +148,24 @@ function render(res, elapsedPage) {
     results.appendChild(h('details', { class: 'more' }, h('summary', { text: 'Messages from ahkab' }),
       h('pre', { text: res.console })));
   }
+}
+
+// The circuit as drawn by the schematic generator forked from Symbulator.
+// The SVG is parsed as XML and imported, never assigned as HTML.
+function renderDrawing(d) {
+  if (d.svg) {
+    const doc = new DOMParser().parseFromString(d.svg, 'image/svg+xml');
+    const svg = doc.documentElement;
+    if (svg.nodeName.toLowerCase() === 'svg') {
+      svg.setAttribute('role', 'img');
+      svg.setAttribute('aria-label', 'Circuit diagram');
+      const frame = h('div', { class: 'schematic' }, document.importNode(svg, true));
+      return card('Circuit', frame);
+    }
+    return card('Circuit', h('p', { class: 'muted', text: 'The drawing could not be displayed.' }));
+  }
+  const message = d.message || d.error || 'The circuit could not be drawn.';
+  return card('Circuit', h('p', { class: 'muted', text: message }));
 }
 
 function card(title, ...body) {
