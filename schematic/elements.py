@@ -1,0 +1,908 @@
+# Forked for "An interface for ahkab" from Symbulator, by Roberto Perez-Franco:
+# symbulator/elements.py at Symbulator solver commit 5d1c52f (schematic.py last changed e800880 2026-09-15).
+#
+# Original code: Copyright (c) 1999-2026 Roberto Perez-Franco, under the MIT
+# License, whose text is in LICENSE-MIT beside this file and must stay with it.
+# Changes in this fork: Copyright 2026 Roberto Perez-Franco.
+# This fork is distributed under the GNU General Public License, version 2 or
+# (at your option) any later version; see COPYING at the repository root.
+# SPDX-License-Identifier: GPL-2.0-or-later AND MIT
+
+"""
+Circuit-description parser and validator.
+
+Ports the parsing/validation half of Symbulator: `symbv8s1` (element name
+sanity check), `symbv8s2` (per-element field-count check), and `symbv8s3`
+(topology validation: grounding, duplicate names, node conflicts).
+
+Circuit description syntax (unchanged from the calculator, minus the
+leading colon it required):
+
+    "r1,1,0,1k:e1,1,0,5:c1,1,2,10'u"
+
+Elements are separated by `:` and fields within an element by `,`. The
+first character of an element's name selects its type:
+
+    r  resistor            name,n1,n2,value
+    l  inductor             name,n1,n2,value[,initial_current]
+    c  capacitor             name,n1,n2,value[,initial_voltage]
+    e  voltage source (indep. or dependent)   name,n1,n2,value
+    j  current source (indep. or dependent)   name,n1,n2,value
+    o  ideal op-amp (nullor)     name,n_plus,n_minus,n_out
+    m  mutual inductance          name,Lname1,Lname2,M
+    s  short circuit               name,n1,n2
+    t  ideal transformer            name,n1,n2,turns1,turns2
+                                 or name,n1,n2,[turns1,turns2]
+                                 or name,[tl,bl],[tr,br],[turns1,turns2]
+    z,y,h,g,a,b  two-port block     name,n1,n2[,[p11,p12,p21,p22]]
+                                 or name,[tl,bl],[tr,br][,[p11,p12,p21,p22]]
+
+Node "0" is the ground/reference node.
+
+A transformer and a two-port block have two ports, and each port has
+two terminals. The calculator's form names the *top* terminal of each
+port -- n1 on the left, n2 on the right -- and grounds the other two.
+Since #314 (6 Sep 2026) a node term may be a bracketed pair,
+[top,bottom], and then all four terminals are named: [tl,bl] is the
+left port, [tr,br] the right. The two-node form is the paired form with
+both bottoms on 0, and the engine treats it exactly so. The transformer's
+turns may be written as a pair too, [turns1,turns2], and must be when
+the nodes are pairs. Brackets mean exactly these things, a resistor's
+parallel shorthand, and nothing else (#165).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Sequence, List, Optional
+
+from .si_prefix import expand_shorthand
+
+VALID_PREFIXES = "abceghjlmorstyz"
+
+# name,n1,n2[,...]  -- total field count including the element's own name.
+FIELD_COUNTS = {
+    "r": 4,
+    "l": 4,
+    "c": 4,
+    "e": 4,
+    "j": 4,
+    "o": 4,
+    "m": 4,
+    "s": 3,
+    "t": 5,
+    "z": 3,
+    "y": 3,
+    "h": 3,
+    "g": 3,
+    "a": 3,
+    "b": 3,
+}
+
+# l/c may optionally carry one extra field -- an initial condition
+# (initial inductor current / initial capacitor voltage) -- used only by
+# s-domain (fd) and transient (tr) analysis; ignored in dc/ac. Unlike the
+# original, which switched the *expected* field count based on which
+# analysis tool was running, this port always accepts either count for
+# l/c and simply treats a missing initial condition as 0.
+OPTIONAL_IC_KINDS = {"l", "c"}
+
+TWO_PORT_KINDS = set("zyghab")
+# The two-port elements: a transformer and the six parameter blocks.
+# In their two-node form these ground their own lower terminals, so the
+# circuit is grounded by their presence and neither named node may be
+# "0". In the paired form (#314) they ground nothing and name their
+# bottoms themselves; `Element.four_node` says which form an element
+# took, and the checks below ask it rather than the kind alone.
+PORT_KINDS = set("tzyghab")
+GROUNDED_ELEMENT_KINDS = PORT_KINDS   # kept for readers of the old name
+
+
+def _pair_entries(text: str) -> Optional[List[str]]:
+    """The entries of a bracketed term, or None when `text` is not one.
+
+    By the time a field exists, `expand_shorthand` has rewritten the
+    typed `[a,b]` to `pr(a,b)`, its one internal encoding of brackets;
+    the app also appends a literal `[...]` when it materialises a
+    two-port's tacit parameter term, so both spellings are read. Splits
+    on top-level commas only, so `[1'k,pr(2,2)]` stays two entries."""
+    if text is None:
+        return None
+    t = text.strip()
+    if t.startswith("pr(") and t.endswith(")"):
+        inner = t[3:-1]
+    elif t.startswith("[") and t.endswith("]"):
+        inner = t[1:-1]
+    else:
+        return None
+    parts: List[str] = []
+    depth, current = 0, ""
+    for ch in inner:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    parts.append(current.strip())
+    return parts
+
+from . import messages as M
+
+class CircuitError(ValueError):
+    """Raised for any issue found while parsing/validating a circuit.
+
+    Since #199 it carries a **code and its arguments** as well as its
+    English:
+
+        raise CircuitError(E_TWOPORT_LIST_LEN, name=el.name, n=len(items))
+
+    `exc.code` is the number, `exc.args_map` the arguments by name, and
+    `str(exc)` the English rendered from `messages.CATALOGUE`. The
+    interface reads the code and puts it into whichever of thirteen
+    languages is on; everything else -- a traceback, a bug report, the
+    `.txt` export, verify_lesson.py's output -- reads the English, which
+    is why the package keeps it rather than shipping bare numbers.
+
+    **A plain string still works**, and is what `str(exc)` gives you
+    back: `CircuitError("some sentence")` sets `code` to None. That is
+    not a transition shim to be removed later. It is how an exception
+    re-raised from elsewhere, or one this package has not got round to
+    coding, keeps flowing through unchanged -- and it is what let #199
+    land without the app and the package having to deploy in step.
+    """
+
+    def __init__(self, code_or_message, **args):
+        if isinstance(code_or_message, int):
+            from .messages import render, severity
+            self.code = code_or_message
+            self.args_map = args
+            self.severity = severity(code_or_message)
+            super().__init__(render(code_or_message, args))
+        else:
+            self.code = None
+            self.args_map = {}
+            self.severity = "error"
+            super().__init__(code_or_message)
+
+
+@dataclass
+class Element:
+    """One parsed circuit element -- a resistor, source, op-amp, etc.
+    `fields` holds every field after the name, still as raw strings
+    (nodes, values, or references to other elements depending on `kind`);
+    `n1`/`n2`/`value`/`ic` below are convenience accessors into it, since
+    "which field means what" differs by element kind (see FIELD_COUNTS
+    and the syntax table in the module docstring)."""
+    name: str            # full element name, e.g. "r1"
+    kind: str             # first letter of name, e.g. "r"
+    fields: List[str] = field(default_factory=list)  # fields after the name
+    #: The same fields as the reader typed them, before `[a,b]` became
+    #: `pr(a,b)` and `1'k` became `1*10**3`. Kept only so that a value the
+    #: parser cannot read can be quoted back the way it was written; empty
+    #: when nothing was rewritten. See engine's `_value`.
+    raw_fields: List[str] = field(default_factory=list)
+
+    @property
+    def n1(self) -> str:
+        """First node/terminal (fields[0]) -- every element kind has one
+        in the same position, so this accessor is always safe to use."""
+        return self.fields[0]
+
+    @property
+    def n2(self) -> str:
+        """Second node/terminal (fields[1]) -- same as n1, always in the
+        same position regardless of element kind."""
+        return self.fields[1]
+
+    @property
+    def value(self) -> Optional[str]:
+        """Raw value expression, for element kinds that have one."""
+        if self.kind in ("r", "l", "c", "e", "j", "m"):
+            return self.fields[2]
+        return None
+
+    @property
+    def ic(self) -> str:
+        """Initial condition (initial inductor current / capacitor
+        voltage), for l/c elements only. "0" if not given."""
+        if self.kind in OPTIONAL_IC_KINDS and len(self.fields) >= 4:
+            return self.fields[3]
+        return "0"
+
+    # -- the two-port elements: transformer and parameter blocks (#314) --
+
+    @property
+    def four_node(self) -> bool:
+        """True when a transformer or two-port block names all four of
+        its terminals as two bracketed pairs; False for the calculator's
+        two-node form, whose lower terminals are ground."""
+        return (self.kind in PORT_KINDS and len(self.fields) >= 2
+                and _pair_entries(self.fields[0]) is not None)
+
+    @property
+    def port_nodes(self):
+        """((top_left, bottom_left), (top_right, bottom_right)) for a
+        transformer or two-port block -- the two terminals of each port,
+        with "0" standing in for the bottoms of the two-node form. None
+        for every other kind."""
+        if self.kind not in PORT_KINDS:
+            return None
+        if self.four_node:
+            left = _pair_entries(self.fields[0])
+            right = _pair_entries(self.fields[1]) or [self.fields[1], "0"]
+            return ((left[0], left[1] if len(left) > 1 else "0"),
+                    (right[0], right[1] if len(right) > 1 else "0"))
+        return ((self.fields[0], "0"), (self.fields[1], "0"))
+
+    @property
+    def nodes(self) -> List[str]:
+        """Every node this element touches, by name, in the order
+        written: a port element's four (or two) terminals, an op-amp's
+        three, everything else's two. A mutual inductance names
+        inductors rather than nodes and answers with an empty list."""
+        if self.kind == "m":
+            return []
+        if self.kind in PORT_KINDS:
+            (tl, bl), (tr, br) = self.port_nodes
+            out = [tl, tr] if not self.four_node else [tl, bl, tr, br]
+            return out
+        return [self.fields[i] for i in _IDENTIFIER_FIELD_IDX.get(self.kind, ())
+                if i < len(self.fields)]
+
+    @property
+    def turns(self):
+        """(turns1, turns2) as typed, for a transformer: the two bare
+        fields after the nodes, or the entries of the bracketed pair.
+        None for every other kind."""
+        if self.kind != "t":
+            return None
+        if len(self.fields) >= 4:
+            return (self.fields[2], self.fields[3])
+        pair = _pair_entries(self.fields[2]) if len(self.fields) > 2 else None
+        if pair and len(pair) == 2:
+            return (pair[0], pair[1])
+        return None
+
+    @property
+    def param_idx(self) -> Optional[int]:
+        """Index of a two-port block's parameter term, or None when it
+        carries none: the third field, after the two node terms."""
+        if self.kind in TWO_PORT_KINDS and len(self.fields) == 3:
+            return 2
+        return None
+
+
+# Field indices (0-based, *after* the element name) that hold structural
+# identifiers -- node names, or references to other elements. These fold
+# to lowercase along with the element's own name, so `R1` and `r1` are
+# one resistor and node `A` and node `a` are one node. Value fields are
+# deliberately absent: case matters there ('M vs 'm, Heaviside vs
+# heaviside).
+_IDENTIFIER_FIELD_IDX = {
+    "r": (0, 1), "l": (0, 1), "c": (0, 1), "e": (0, 1), "j": (0, 1),
+    "s": (0, 1), "t": (0, 1),
+    "o": (0, 1, 2),          # n+, n-, output node
+    "m": (0, 1),             # the two inductors it couples
+    "z": (0, 1), "y": (0, 1), "h": (0, 1), "g": (0, 1),
+    "a": (0, 1), "b": (0, 1),
+}
+
+
+def _split_elements(desc: str) -> List[str]:
+    """Break a raw circuit-description string into one raw substring per
+    element, tolerating either separator style (see comment below) and
+    stray leading/trailing separators or blank lines. Raises CircuitError
+    if nothing is left after splitting (an empty or whitespace-only
+    description)."""
+    # Newlines work the same as ":" -- a circuit can be written one
+    # element per line (natural in a file or a web textarea) or all on
+    # one line separated by colons (the original calculator syntax).
+    desc = desc.replace("\r\n", ":").replace("\r", ":").replace("\n", ":")
+    desc = desc.strip()
+    if desc.startswith(":"):
+        desc = desc[1:]
+    parts = [p.strip() for p in desc.split(":") if p.strip() != ""]
+    if not parts:
+        raise CircuitError(M.E_EMPTY_DESCRIPTION)
+    return parts
+
+
+def _split_fields(raw: str) -> List[str]:
+    """Split one element's raw text on `,` into fields, the way
+    `str.split(",")` does -- except a comma inside parentheses or
+    square brackets doesn't count as a separator. Parentheses because
+    the `[...]` parallel-impedance shortcut (see
+    si_prefix.expand_shorthand) has already been expanded to
+    `pr(a,b,c)` by the time the *solve* path runs; brackets because the
+    as-typed copy of the line (raw_fields, the #59 machinery) is split
+    too, and its `[100,10,20,50]` two-port parameter term (#163) must
+    stay one field there as well, or the typed and rewritten splits
+    stop lining up and the typed spelling is lost."""
+    fields: List[str] = []
+    depth = 0
+    current = ""
+    for ch in raw:
+        if ch in "([":
+            depth += 1
+            current += ch
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+            current += ch
+        elif ch == "," and depth == 0:
+            fields.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    fields.append(current.strip())
+    return fields
+
+
+def parse_circuit(desc: str, expand_si: bool = True,
+                  references: Sequence[str] = ()) -> List[Element]:
+    """Parse a Symbulator-style circuit description string into a list
+    of Element objects. Raises CircuitError on malformed input (mirrors
+    symbv8s1 + symbv8s2).
+
+    `expand_si=False` parses the same elements but leaves SI-prefix
+    shorthand (`4.7'M`) in each field as typed, instead of expanding it
+    to a literal number. Use this when the parsed elements are only
+    going to be echoed back to the user (e.g. to rebuild the circuit
+    description after normalizing i/I to j or resolving an ambiguous
+    bare suffix) -- the SI notation is worth more to a person reading it
+    back than the number it stands for, and it still gets expanded the
+    normal way (`expand_si=True`, the default) at actual solve time."""
+    raw_elements = _split_elements(desc)
+
+    elements: List[Element] = []
+    seen_names = set()
+
+    for raw in raw_elements:
+        typed = raw
+        raw = expand_shorthand(raw, si=expand_si)
+        parts = _split_fields(raw)
+        typed_parts = _split_fields(typed) if typed != raw else parts
+        if not parts or parts[0] == "":
+            raise CircuitError(M.E_MALFORMED_ELEMENT, raw=raw)
+
+        # Element names, element letters and node names are all
+        # case-insensitive: they fold to lowercase here so that R1 and
+        # r1 are the same resistor, and node A and node a are the same
+        # node. Folding before the duplicate check means writing both
+        # spellings is correctly reported as a duplicate rather than
+        # silently creating two elements.
+        name = parts[0].lower()
+        kind = name[0] if name else ""
+
+        if kind not in VALID_PREFIXES:
+            raise CircuitError(M.E_UNKNOWN_KIND, kind=kind, name=parts[0])
+
+        # A name must survive being embedded in a symbol: the answers are
+        # written as i_<name>, v_<name>, p_<name>, and a reader must be
+        # able to type those inside a value or an added equation. A name
+        # like `r-x` parses fine on its own, but `2*i_r-x` silently reads
+        # as `2*i_r - x` and solves to an answer full of phantom symbols
+        # -- so the characters that would do that are refused here, where
+        # the message can still point at the right element.
+        if not name.isidentifier():
+            raise CircuitError(M.E_BAD_NAME_CHAR, name=parts[0])
+
+        if name in seen_names:
+            raise CircuitError(M.E_DUPLICATE_NAME, name=name)
+        seen_names.add(name)
+
+        # `[...]` means exactly two things (#165, restoring the
+        # calculator's scope): the parallel-resistor shorthand, in a
+        # RESISTOR's value, and a two-port's parameter term. Anywhere
+        # else it used to be silently passed to pr() -- turning
+        # `e1,1,0,[4,4]` into a meaningless "2 V" source -- so it now
+        # stops with a message instead. The typed text is what is
+        # checked: by the time `parts` exists the brackets have been
+        # rewritten to pr(...), and a pr(...) the user *typed* is a
+        # legitimate function call, allowed anywhere.
+        if typed != raw and ("[" in typed or "]" in typed):
+            # Where brackets may appear (#165, widened by #314): a
+            # resistor's value; a two-port's parameter term (part 3);
+            # a transformer's turns (part 3); and, for both port kinds,
+            # the two node terms (parts 1 and 2) as [top,bottom] pairs.
+            if kind == "r":
+                bracket_ok = {3}
+            elif kind in PORT_KINDS:
+                bracket_ok = {1, 2, 3}
+            else:
+                bracket_ok = set()
+            for i, tp in enumerate(typed_parts):
+                if ("[" in tp or "]" in tp) and i not in bracket_ok:
+                    raise CircuitError(M.E_BRACKETS_MISUSED,
+                                       value=typed.strip())
+
+        expected = FIELD_COUNTS[kind]
+        if kind in OPTIONAL_IC_KINDS or kind in TWO_PORT_KINDS:
+            allowed = {expected, expected + 1}
+        elif kind == "t":
+            # name,n1,n2,N1,N2 -- or the turns as one bracketed pair,
+            # name,n1,n2,[N1,N2] and name,[tl,bl],[tr,br],[N1,N2] (#314).
+            allowed = {expected, expected - 1}
+        else:
+            allowed = {expected}
+        if len(parts) not in allowed:
+            if kind in OPTIONAL_IC_KINDS:
+                raise CircuitError(M.E_TERMS_WITH_IC, name=name,
+                                   got=len(parts), expected=expected,
+                                   expected_ic=expected + 1, kind=kind)
+            if kind in TWO_PORT_KINDS:
+                raise CircuitError(M.E_TERMS_TWO_PORT, name=name,
+                                   got=len(parts), expected=expected,
+                                   expected_params=expected + 1)
+            if kind == "t":
+                raise CircuitError(M.E_TERMS_TRANSFORMER, name=name,
+                                   got=len(parts))
+            raise CircuitError(M.E_TERMS_EXACT, name=name, got=len(parts),
+                               expected=expected, kind=kind)
+
+        fields = list(parts[1:])
+        for idx in _IDENTIFIER_FIELD_IDX.get(kind, ()):
+            if idx < len(fields):
+                fields[idx] = fields[idx].lower()
+
+        # Only when the rewrite actually changed something, and only when
+        # it split the same way -- a mismatch means the two cannot be lined
+        # up field by field, and a wrong original is worse than none.
+        raw_fields = (list(typed_parts[1:])
+                      if typed != raw and len(typed_parts) == len(parts)
+                      else [])
+        element = Element(name=name, kind=kind, fields=fields,
+                          raw_fields=raw_fields)
+        if kind in PORT_KINDS:
+            _validate_port_forms(element)   # node pairs and turns (#314)
+        if kind in TWO_PORT_KINDS and len(fields) == 3:
+            two_port_param_texts(element)   # validates; raises if malformed
+        elements.append(element)
+
+    _validate_couplings(elements, expand=expand_si)
+    _validate_topology(elements, references=references)
+    return elements
+
+
+def _coupling_factor(field: str) -> Optional[str]:
+    """The k expression when a coupling is written `k=0.5` (#438),
+    else None. The letter is case-insensitive and spaces are allowed
+    round the `=`."""
+    text = field.strip()
+    if len(text) > 2 and text[0] in "kK" and text[1:].lstrip().startswith("="):
+        return text[1:].lstrip()[1:].strip()
+    return None
+
+
+def _numeric(field: str):
+    """A value field as a SymPy number, or None when it is symbolic or
+    unreadable -- the engine reports an unreadable value itself, with
+    the field's own message, so nothing is refused here on its account."""
+    import sympy as sp
+    from .si_prefix import safe_sympify, expand_value
+    try:
+        expr = safe_sympify(expand_value(field), reserve_imaginary=True)
+    except Exception:                                      # noqa: BLE001
+        return None
+    if getattr(expr, "free_symbols", None):
+        return None
+    try:
+        return sp.nsimplify(expr) if expr.is_Rational else sp.N(expr)
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def _validate_couplings(elements: List[Element], expand: bool = True) -> None:
+    """The m line checked, and its `k=` form expanded (#438, Roberto,
+    13 Sep 2026).
+
+    Both named elements must exist and be of one kind: two inductors
+    in henries, or two coils written as impedances in ohms. A numeric
+    value is checked for that kind -- real and positive in henries,
+    positive imaginary in ohms -- for the two coils and the coupling
+    alike; a symbol passes. With everything numeric the coupling may
+    not exceed sqrt(L1*L2), which is a coupling factor of 1.
+
+    `m,l1,l2,k=0.5` gives the coupling as the factor k instead: the
+    field is rewritten here to k*sqrt(L1*L2) in henries, or to
+    j*k*sqrt(|Z1|*|Z2|) in ohms, so that nothing downstream ever sees
+    k. A numeric k must lie in (0, 1]. In echo mode (`expand` False)
+    the typed field is kept and nothing is checked, since those
+    elements are only ever written back to the reader."""
+    if not expand:
+        return
+    import sympy as sp
+    by_name = {el.name: el for el in elements}
+    for m in elements:
+        if m.kind != "m":
+            continue
+        coils = []
+        for other in m.fields[:2]:
+            el = by_name.get(other)
+            if el is None or el is m:
+                raise CircuitError(M.E_M_NO_SUCH_ELEMENT, name=m.name, other=other)
+            coils.append(el)
+        a, b = coils
+        if a.kind != b.kind or a.kind not in ("l", "r"):
+            raise CircuitError(M.E_M_MIXED_KINDS, name=m.name, a=a.name, b=b.name)
+        henries = a.kind == "l"
+
+        def check(which, field, zero_ok=False):
+            # A coupling of exactly 0 is "no coupling" and has always
+            # been accepted (the engine stamps nothing for it); a coil
+            # of 0 H is a wire and cannot be coupled.
+            val = _numeric(field)
+            if val is None:
+                return None
+            re_, im_ = sp.re(val), sp.im(val)
+            if henries:
+                if im_ != 0 or not (re_ > 0 or (zero_ok and re_ == 0)):
+                    raise CircuitError(M.E_M_NOT_REAL, name=m.name,
+                                       which=which, value=field.strip())
+                return re_
+            if re_ != 0 or not (im_ > 0 or (zero_ok and im_ == 0)):
+                raise CircuitError(M.E_M_NOT_IMAGINARY, name=m.name,
+                                   which=which, value=field.strip())
+            return im_
+
+        la = check(a.name, a.value)
+        lb = check(b.name, b.value)
+        kfield = _coupling_factor(m.fields[2])
+        if kfield is not None:
+            k = _numeric(kfield)
+            if k is not None and (sp.im(k) != 0 or not (0 < sp.re(k) <= 1)):
+                raise CircuitError(M.E_M_K_RANGE, name=m.name, k=kfield)
+            if henries:
+                expr = "(%s)*sqrt((%s)*(%s))" % (kfield, a.value, b.value)
+            else:
+                expr = "I*(%s)*sqrt(-(%s)*(%s))" % (kfield, a.value, b.value)
+            m.fields[2] = expr
+            if m.raw_fields:
+                m.raw_fields[2] = "k=" + kfield
+            continue
+        mv = check("the coupling", m.fields[2], zero_ok=True)
+        if la is not None and lb is not None and mv is not None:
+            limit = sp.sqrt(la * lb)
+            if mv > limit * (1 + sp.Rational(1, 10**9)):
+                shown = sp.N(limit, 6)
+                raise CircuitError(M.E_M_TOO_STRONG, name=m.name,
+                                   value=m.fields[2].strip(),
+                                   limit=(str(shown) + ("j" if not henries else "")))
+
+
+def _validate_port_forms(el: Element) -> None:
+    """The shapes a transformer or two-port block may take (#314).
+
+    The two node terms are both bare names, or both bracketed pairs
+    [top,bottom] with exactly two entries; one of each is refused. A
+    transformer's turns are two bare values after bare nodes, or one
+    bracketed pair [N1,N2]; paired nodes require the paired turns, so
+    the four-node form is written one way only."""
+    left = _pair_entries(el.fields[0])
+    right = _pair_entries(el.fields[1])
+    if (left is None) != (right is None):
+        raise CircuitError(M.E_PORT_PAIR, name=el.name)
+    if left is not None:
+        for pair in (left, right):
+            if len(pair) != 2 or any(p == "" for p in pair):
+                raise CircuitError(M.E_PORT_PAIR, name=el.name)
+    if el.kind == "t":
+        if len(el.fields) == 4:
+            # bare turns: neither may be a bracket, and the nodes must be
+            # bare too -- `t,[a,b],[c,d],1,2` is not one of the forms
+            if left is not None or any(_pair_entries(f) is not None
+                                       for f in el.fields[2:4]):
+                raise CircuitError(M.E_TERMS_TRANSFORMER, name=el.name,
+                                   got=len(el.fields) + 1)
+        else:
+            pair = _pair_entries(el.fields[2])
+            if pair is None or len(pair) != 2 or any(p == "" for p in pair):
+                raise CircuitError(M.E_TERMS_TRANSFORMER, name=el.name,
+                                   got=len(el.fields) + 1)
+
+
+def two_port_param_texts(el: Element) -> Optional[List[str]]:
+    """The four parameter expressions from a two-port element's optional
+    last term, or None when the element carries only its two nodes.
+
+    The term is written `[p11,p12,p21,p22]`; by the time fields exist,
+    `expand_shorthand` has rewritten the brackets to `pr(...)` (its
+    universal internal encoding of `[...]`), which is also accepted
+    typed directly. Raises CircuitError when the term is not a
+    four-entry list."""
+    if el.kind not in TWO_PORT_KINDS or len(el.fields) < 3:
+        return None
+    text = el.fields[2].strip()
+    shown = (el.raw_fields[2].strip()
+             if len(el.raw_fields) > 2 else text)
+    if not (text.startswith("pr(") and text.endswith(")")):
+        raise CircuitError(M.E_TWOPORT_LAST_TERM, name=el.name, shown=shown)
+    inner = text[3:-1]
+    parts: List[str] = []
+    depth, current = 0, ""
+    for ch in inner:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    parts.append(current.strip())
+    if len(parts) != 4 or any(p == "" for p in parts):
+        raise CircuitError(M.E_TWOPORT_LIST_LEN, name=el.name,
+                           n=len([p for p in parts if p]))
+    return parts
+
+
+def two_port_param_conditions(elements: List[Element]) -> List[str]:
+    """The `name = value` bindings implied by every two-port parameter
+    term in `elements`, ready to run through the solver's conditions
+    machinery -- which is what "the values are stored in the parameter
+    variables" means operationally: the same substitution the TI's `|`
+    operator applied to stored variables.
+
+    A self-referential entry (`z,1,2,[z11,z12,z21,z22]` -- the tacit
+    default written out) binds nothing: the parameter is already the
+    free symbol it names."""
+    conds: List[str] = []
+    for el in elements:
+        texts = two_port_param_texts(el)
+        if not texts:
+            continue
+        for ij, text in zip(("11", "12", "21", "22"), texts):
+            name = f"{el.name}{ij}"
+            if text.replace("_", "").lower() == name.replace("_", "").lower():
+                continue
+            conds.append(f"{name} = {text}")
+    return conds
+
+
+def _validate_topology(elements: List[Element], two_port_nodes: Optional[tuple] = None,
+                       references: Sequence[str] = ()) -> None:
+    """Whole-circuit sanity checks that can't be done element-by-element
+    (ports `symbv8s3`): the circuit must be grounded (some node is 0, or
+    a grounded-kind element like a two-port block is present), and no
+    element may have both terminals on the same node -- a rule that
+    binds even the short circuit, whose job is joining two *distinct*
+    nodes: a self-loop's current enters and leaves the same KCL sum
+    and so is indeterminate.
+
+    `two_port_nodes`, when given, additionally checks that the two named
+    port nodes (n1, n2) both actually appear somewhere in the circuit --
+    used by tools like `equiv.port()` that ask the caller for two nodes
+    by name and need to catch a typo before wasting a solve on it."""
+    has_ground = False
+    node1_seen = node2_seen = False
+    n1_target, n2_target = (two_port_nodes or (None, None))
+    # A caller's own references (#322: `port()` names the bottoms of
+    # its ports) count as ground for the "is anything grounded" test:
+    # a ladder with no node 0 at all is a legitimate two-port.
+    refs = set(references or ())
+
+    for el in elements:
+        if el.kind in PORT_KINDS and el.four_node:
+            # Four named terminals (#314): the element grounds nothing,
+            # so any of them may be 0 -- `z,[1,0],[2,0]` is the two-node
+            # form written out -- but a port whose two terminals are the
+            # same node is shorted, the same fault as a self-looped
+            # resistor.
+            for top, bottom in el.port_nodes:
+                if top == bottom:
+                    raise CircuitError(M.E_PORT_SAME_NODE, name=el.name)
+                if top == "0" or bottom == "0":
+                    has_ground = True
+        else:
+            if el.kind in PORT_KINDS:
+                if el.n1 == "0" or el.n2 == "0":
+                    raise CircuitError(M.E_TOP_NODE_GROUND, name=el.name)
+
+            if el.n1 == el.n2 and el.kind != "m":
+                raise CircuitError(M.E_SAME_NODE, name=el.name)
+
+            if el.kind in PORT_KINDS or el.n1 == "0" or el.n2 == "0":
+                has_ground = True
+
+        if refs and any(n in refs for n in el.nodes):
+            has_ground = True
+
+        if n1_target is not None:
+            touched = el.nodes
+            if n1_target in touched:
+                node1_seen = True
+            if n2_target in touched:
+                node2_seen = True
+
+    if two_port_nodes is None:
+        if not has_ground:
+            raise CircuitError(M.E_NEED_REFERENCE_NODE)
+        _check_connected(elements, references)
+    else:
+        if n1_target == n2_target:
+            raise CircuitError(M.E_INPUT_SAME_NODE)
+        if not node1_seen:
+            raise CircuitError(M.E_NO_SUCH_NODE, node=n1_target)
+        if not node2_seen:
+            raise CircuitError(M.E_NO_SUCH_NODE, node=n2_target)
+
+
+def _islands(elements: List[Element], references: Sequence[str] = ()):
+    """The connected pieces of the circuit that hold no reference: a
+    list of (nodes in element order, port terminals among them) for
+    each. `references` are nodes a caller holds at 0 besides "0".
+
+    Connectivity is by terminals: r/l/c/e/j/s/t join their two nodes, an
+    op-amp joins all three of its terminals (its nullor constraints tie
+    them together), and each port of a transformer or parameter block
+    joins its own two terminals -- the two ports never join each other,
+    since the element conducts nothing from one side to the other."""
+    parent = {"0": "0"}
+    order: List[str] = []           # every node, first-mention order
+    port_terms: List[str] = []      # port terminals, first-mention order
+    bottoms: List[str] = []         # port bottoms, first-mention order
+    # An element named by an `m` is a coupling's terminal pair too
+    # (#323): the secondary of a coupled pair conducts nothing to the
+    # primary, exactly as a transformer's does, so its side is an island
+    # of the same legitimate kind. Its second node stands in for a
+    # port's bottom when a reference is chosen.
+    #
+    # Any element, not just `l` (#426): in AC a coil is written as an
+    # impedance in ohms -- `m,r2,r3,3j` is Lesson 10's own idiom and
+    # eight of its entries use it. Restricting this to `l` refused
+    # exactly those circuits as floating while the henry spelling of
+    # the same circuit solved, which is the oversight #322/#323 left.
+    coupled = {n for el in elements if el.kind == "m" for n in el.fields[:2]}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    def note(n):
+        if n not in parent:
+            parent[n] = n
+        if n not in order:
+            order.append(n)
+
+    for el in elements:
+        if el.kind == "m":
+            continue
+        if el.kind in PORT_KINDS:
+            for top, bottom in el.port_nodes:
+                note(top); note(bottom)
+                union(top, bottom)
+                for n in (top, bottom):
+                    if n not in port_terms:
+                        port_terms.append(n)
+                if bottom not in bottoms:
+                    bottoms.append(bottom)
+            continue
+        nodes = el.nodes
+        for n in nodes:
+            note(n)
+        for n in nodes[1:]:
+            union(nodes[0], n)
+        if el.name in coupled:
+            for n in nodes:
+                if n not in port_terms:
+                    port_terms.append(n)
+            if len(nodes) > 1 and nodes[1] not in bottoms:
+                bottoms.append(nodes[1])
+
+    # Only node 0 roots a piece. A caller's `references` are hints for
+    # *which* node of an island to hold at 0, never a reason to treat
+    # the island as grounded -- `port()` names both of its ports'
+    # bottoms, and on a ladder with no node 0 those lie in one island
+    # that must get exactly one reference, not two.
+    roots = {find("0")}
+    islands = {}
+    for n in order:
+        r = find(n)
+        if r in roots:
+            continue
+        islands.setdefault(r, []).append(n)
+    out = []
+    for nodes in islands.values():
+        out.append((nodes, [n for n in port_terms if n in nodes],
+                    [n for n in bottoms if n in nodes]))
+    return out
+
+
+def local_references(elements: List[Element],
+                     preferred: Sequence[str] = ()) -> Dict[str, List[str]]:
+    """{reference node: the other nodes of its island} for every island
+    behind a port (#322).
+
+    An island -- a connected piece with no path to node 0 -- is what the
+    far side of a transformer, a parameter block or a magnetically
+    coupled inductor (#323) is when nothing else grounds it: a legitimate circuit whose absolute potentials are
+    undefined, though every current and every difference is not. Nodal
+    analysis needs one reference per piece, so each island gets one:
+    the first of `preferred` that lies in it (`port()` names the
+    bottoms of its ports), else the first port bottom mentioned in it,
+    else its first node. Its voltage is held at 0 and the answers say
+    so. An island with no port terminal at all is a mistake (`r1,2,3,1`
+    hanging on its own) and is not given a reference here."""
+    out: Dict[str, List[str]] = {}
+    for nodes, terms, bottoms in _islands(elements, preferred):
+        if not terms and not any(p in nodes for p in preferred):
+            continue
+        ref = next((p for p in preferred if p in nodes), None)
+        if ref is None:
+            ref = bottoms[0] if bottoms else nodes[0]
+        out[ref] = [n for n in nodes if n != ref]
+    return out
+
+
+def _check_connected(elements: List[Element],
+                     references: Sequence[str] = ()) -> None:
+    """Every node must have a conduction path to a reference. A part of
+    the circuit with no such path (say `r1,2,3,1` hanging on its own) has
+    no defined voltages, and the solver would otherwise return it quietly
+    parametrized in one of its own node voltages (`v_2 = v_3`) rather
+    than flag the mistake (ports `symbv8s3`'s "floating node" check).
+
+    Since #322 an island that holds a port terminal is not a mistake --
+    it is the far side of a transformer or a parameter block, and
+    `local_references` gives it a reference of its own -- so only an
+    island of ordinary elements is reported here."""
+    floating = []
+    for nodes, terms, _ in _islands(elements, references):
+        if not terms and not any(p in nodes for p in references):
+            floating.extend(nodes)
+    if floating:
+        raise CircuitError(M.E_FLOATING_NODES, nodes=", ".join(sorted(floating)))
+
+
+# Which field indices (0-based, after the element name) hold *values*
+# (as opposed to node names / element references), per element kind.
+# Used by find_ambiguous_values -- node names are never treated as
+# ambiguous, so "r1,1,2k,100" with a node literally named "2k" is safe.
+_VALUE_FIELD_IDX = {
+    "r": (2,), "l": (2, 3), "c": (2, 3), "e": (2,), "j": (2,),
+    "m": (2,), "t": (2, 3),
+}
+
+
+def ambiguous_in_elements(elements: List[Element]) -> List[dict]:
+    """Scan parsed elements for bare engineering-notation values -- see
+    find_ambiguous_values."""
+    from .si_prefix import bare_suffix_match
+
+    found: List[dict] = []
+    for e in elements:
+        # A transformer's turns are two bare fields or one bracketed
+        # pair (#314); with the pair there is no fourth field to read.
+        value_idx = ((2,) if e.kind == "t" and len(e.fields) == 3
+                     else _VALUE_FIELD_IDX.get(e.kind, ()))
+        for idx in value_idx:
+            if idx >= len(e.fields):
+                continue
+            m = bare_suffix_match(e.fields[idx])
+            if m:
+                found.append({"element": e.name, "token": e.fields[idx].strip(),
+                              "number": m[0], "letter": m[1]})
+    return found
+
+
+def find_ambiguous_values(desc: str) -> List[dict]:
+    """Scan a circuit description for bare engineering-notation values
+    ("1k", "4.7u") whose meaning is ambiguous between an SI unit (1'k)
+    and number*variable (1*k). Returns one dict per occurrence:
+    {"element", "token", "number", "letter"}. Parse errors propagate
+    as CircuitError, same as parse_circuit."""
+    return ambiguous_in_elements(parse_circuit(desc))
