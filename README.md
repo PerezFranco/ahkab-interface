@@ -64,7 +64,8 @@ finish waits for them.
 
 - [x] The ahkab source the page ships must be publicly available: the
       `lazy-imports` branch of the fork was pushed on 16 Sep 2026.
-- [ ] Publish this repository and link its source from the page footer.
+- [x] Publish this repository and link its source from the page footer:
+      <https://github.com/PerezFranco/ahkab-interface>, 17 Sep 2026.
 - [ ] Check PythonAnywhere's static-file hosting details at the time.
 
 ## Licence
