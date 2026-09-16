@@ -65,12 +65,18 @@ _PREFIXES = [(1e9, 'G'), (1e6, 'M'), (1e3, 'k'), (1.0, ''), (1e-3, 'm'),
 
 def si(x):
     """``1500.0`` -> ``'1.5k'``, ``1.5e-05`` -> ``'15u'``: the shorthand a
-    netlist would use. The generator shows ``u`` as micro."""
+    netlist would use. The generator shows ``u`` as micro.
+
+    A value from 0.1 up to 1 stays a plain decimal -- ``0.51`` rather
+    than ``510m`` -- as the netlist writes it; the generator letters
+    the drawn label the same way (``_engineering`` in schematic.py)."""
     x = float(x)
     if x == 0 or not math.isfinite(x):
         return '0' if x == 0 else repr(x)
     if abs(x) >= 1e12:
         return '%g' % x
+    if 0.1 <= abs(x) < 1:
+        return '%g' % float('%.6g' % x)
     for scale, prefix in _PREFIXES:
         if abs(x) >= scale * (1 - 1e-9):
             return '%g%s' % (float('%.6g' % (x / scale)), prefix)

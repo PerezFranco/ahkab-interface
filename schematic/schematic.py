@@ -148,6 +148,16 @@ def _engineering(text: str) -> Optional[str]:
         return None
     if num == 0:
         return "0"
+    # Fork (17 Sep 2026): from 0.1 up to 1 a value stays a decimal --
+    # `0.65 H`, not `650m H`. A reader checking the picture against a
+    # netlist that says 0.65 should not have to convert, no book writes
+    # a millihenry with a space before its unit, and `650m H` is easy
+    # to misread. Below 0.1 the prefix earns its place (`50m V`,
+    # `10n F`). Seven of the interface's linear baseline drawings
+    # carry such a value and were regenerated for this.
+    if 0.1 <= abs(num) < 1:
+        scaled = "{0:.4g}".format(num)
+        return scaled.rstrip("0").rstrip(".") if "." in scaled else scaled
     factor, prefix = 1.0, ""
     for f, p in _OUT_PREFIX:
         if abs(num) >= f:
@@ -464,19 +474,26 @@ REF_ARROW_MIN = 14.0   # shortest half-length the shaft is drawn at
 # stand in the book's proportion to the symbols that are: the diode's
 # triangle is as tall as the resistor's zigzag and about as long as the
 # capacitor's plate gap, the switch's contacts sit as far apart as the
-# source circle is wide, and the MOSFET's channel is a shade longer
-# than the resistor's zigzag, since a transistor is the largest ordinary
-# symbol in every book that draws one. Every stroke is the body weight.
-# **Each of these is a matter of taste and awaits Roberto's ruling.**
+# source circle is wide, and the MOSFET's channel is a little longer
+# than the source circle is wide, since a transistor is the largest
+# ordinary symbol in every book that draws one and the eye goes to it
+# first. Every stroke is the body weight.
+#
+# These are the interface's own choices (17 Sep 2026), taken for a
+# reader who is checking a typed netlist against the picture: what
+# reads at a glance in the books such a reader has open (Sedra & Smith,
+# Razavi) and in the SPICE tools they know, in the style of the rest of
+# the drawing. Each choice is explained at its symbol.
 DIODE_LEN = 9.0 * PT          # the triangle, anode to cathode, 14.4
 DIODE_HALF = 5.0 * PT         # half its base, and half the bar, 8.0
 SW_HALF = 12.0                # a switch's contacts, either side of centre
 SW_RISE = 9.0                 # how high the open blade lifts at its tip
-MOS_CH = 26.0                 # the channel bar, along the element
+SW_CONTACT_R = 1.5 * PT       # the open circle at each contact, 2.4
+MOS_CH = 30.0                 # the channel bar, along the element
 MOS_JOG = 12.0                # the channel's offset from the lead axis,
 #                               toward the gate; the bulk arrow lives here
 MOS_GAP = 2.0 * PT            # gate bar to channel, 3.2
-MOS_GATE_BAR = 22.0           # the gate bar's length
+MOS_GATE_BAR = 26.0           # the gate bar's length
 MOS_GATE_LEAD = 8.0           # from the gate bar out to the wire
 MOS_BULK_OUT = 10.0           # an untied bulk lead, past the axis
 MOS_ARROW = 6.0               # the bulk arrow's head, and its half-width
@@ -1236,30 +1253,44 @@ def _body_box(length: float, letter: str) -> str:
 
 
 def _body_d(length: float) -> str:
-    """Fork: a diode -- an open triangle pointing from the anode (the
-    n1 end) to the cathode, and the cathode's bar across its tip. Open
-    rather than filled, as the sources' outlines are, and mitred at its
-    corners as the dependent source's diamond is."""
+    """Fork: a diode -- a filled triangle pointing from the anode (the
+    n1 end) to the cathode, and the cathode's bar across its tip.
+
+    Filled, as the books a reader has open draw it (Sedra & Smith,
+    Razavi, Hayt) and as every SPICE schematic tool does: the triangle
+    is the symbol's arrow, and this drawing already fills its
+    arrowheads (the current source's, a reference's) while leaving a
+    source's *outline* open. An open triangle was tried first and read,
+    at 14 px, as a small dependent-source diamond with one corner
+    missing. Mitred at its corners as the diamond is."""
     mid = length / 2.0
     xa, xb = mid - DIODE_LEN / 2.0, mid + DIODE_LEN / 2.0
     return ('<path d="M0 0 L{0:g} 0 M{1:g} 0 L{2:g} 0"/>'
-            '<path d="M{0:g} {3:g} L{1:g} 0 L{0:g} {4:g} Z" fill="none" '
-            'stroke-linejoin="miter"/>'
+            '<path d="M{0:g} {3:g} L{1:g} 0 L{0:g} {4:g} Z" '
+            'fill="currentColor" stroke-linejoin="miter"/>'
             '<path d="M{1:g} {3:g} L{1:g} {4:g}"/>'
             .format(xa, xb, length, -DIODE_HALF, DIODE_HALF))
 
 
 def _body_w(length: float) -> str:
-    """Fork: a switch, drawn open -- the blade hinged at the n1 contact
-    and lifted clear of the n2 contact. Which way it leans is the
-    symbol's own: toward -y, which `_draw_element`'s transform puts
-    above a horizontal switch and to the right of a vertical one, the
-    side its labels are on."""
+    """Fork: a switch, drawn open -- a small open circle at each
+    contact, and the blade hinged at the n1 contact and lifted clear of
+    the n2 contact. The circles are what tell a reader, at a glance,
+    that the gap in the wire is a switch and not a break in the
+    drawing; a dot would say "junction" in this generator, so the
+    contacts are open. Which way the blade leans is the symbol's own:
+    toward -y, which `_draw_element`'s transform puts above a
+    horizontal switch and to the right of a vertical one, the side its
+    labels are on."""
     mid = length / 2.0
     xa, xb = mid - SW_HALF, mid + SW_HALF
+    r = SW_CONTACT_R
     return ('<path d="M0 0 L{0:g} 0 M{1:g} 0 L{2:g} 0"/>'
-            '<path d="M{0:g} 0 L{3:g} {4:g}"/>'
-            .format(xa, xb, length, xb - 1.0, -SW_RISE))
+            '<circle cx="{3:g}" cy="0" r="{5:g}" fill="none"/>'
+            '<circle cx="{4:g}" cy="0" r="{5:g}" fill="none"/>'
+            '<path d="M{6:g} {7:g} L{8:g} {9:g}"/>'
+            .format(xa - r, xb + r, length, xa, xb, r,
+                    xa + r * 0.85, -r * 0.5, xb - 1.0, -SW_RISE))
 
 
 def _body_mos(length: float, p_channel: bool, tied: bool) -> str:
@@ -1272,6 +1303,15 @@ def _body_mos(length: float, p_channel: bool, tied: bool) -> str:
     wired elsewhere (`tied` False), or, when it is the source's, only
     as far as the axis and then along it to the source's jog, the way
     a CAD symbol shows a substrate tied to its source.
+
+    One symbol family whether or not the bulk is tied, rather than the
+    simplified three-terminal symbol (arrow on the source lead) for
+    the tied case: a drawing with both kinds of transistor then shows
+    them as the same device differently wired, the arrow is in the
+    same place on every one, and it is the symbol the SPICE tools a
+    reader already uses draw by default. The simplified symbol is what
+    Razavi and the later chapters of Sedra & Smith use, and a reader
+    of those will still recognise this one -- they meet it first.
 
     **The channel type is the bulk arrow, nothing else**: pointing into
     the channel for n-channel (the p-substrate to n-channel junction),
@@ -5836,7 +5876,14 @@ def draw(desc: str):
 # * The symbols are not Nilsson & Riedel's, who draw none of these.
 #   The MOSFET is the four-terminal symbol with its bulk arrow as the
 #   only channel-type mark, the bulk stub joined to the source when
-#   the two are one node; the diode an open triangle and bar; the
-#   switch a blade hinged at n1. Their sizes stand in the book's
-#   proportion to the symbols that are measured, and are Roberto's
-#   to move.
+#   the two are one node; the diode a filled triangle and bar; the
+#   switch a blade hinged at n1 between two open contacts. Their
+#   sizes stand in the book's proportion to the symbols that are
+#   measured. These are the interface's own decisions of 17 Sep 2026,
+#   each explained at its symbol; with them: a transistor between two
+#   live nodes stays on the row (above), a gate lane keeps its height
+#   and its shared bus (a mirror's gates on one line with a dot at
+#   each tap is how every book draws one), a MOSFET is labelled by its
+#   model and W/L (the two things a reader checks against the `m`
+#   line), a diode by its model and a switch by what closes it (its
+#   model only names thresholds, which the results tables carry).

@@ -61,6 +61,25 @@ def test_si_shorthand():
     assert ns.si(0.3e3) == '300'
     assert ns.si(1e20) == '1e+20'
     assert ns.si(0) == '0'
+    # 0.1 up to 1 stays a decimal, as the netlist writes it; below, the prefix
+    assert ns.si(0.51) == '0.51'
+    assert ns.si(0.1) == '0.1'
+    assert ns.si(0.05) == '50m'
+    assert ns.si(-0.65) == '-0.65'
+
+
+def test_drawn_values_between_a_tenth_and_one_stay_decimal():
+    eng = sc._engineering
+    assert eng('0.1') == '0.1'
+    assert eng('0.51') == '0.51'
+    assert eng('0.65') == '0.65'
+    assert eng('0.999') == '0.999'
+    assert eng('1') == '1'
+    assert eng('0.05') == '50m'          # below a tenth the prefix stays
+    assert eng('100m') == '0.1'          # a typed prefix reads the same
+    assert eng('-0.65') == '-0.65'
+    assert eng('-0.05') == '-50m'
+    assert eng('1500') == '1.5k' and eng('1e-6') == '1µ'
 
 
 def test_dependent_sources_keep_ahkab_conventions(tmp_path):
@@ -156,7 +175,9 @@ def test_diode_is_anode_then_cathode_and_labelled_by_its_model():
           if e.kind == 'd'][0]
     assert (el.n1, el.n2, el.value, el.nodes) == ('2', '0', 'di', ['2', '0'])
     svg = ns.draw(circ)['svg']
-    assert 'D' in labels(svg) or any('D' in s for s in labels(svg))
+    assert any('D' in s for s in labels(svg))
+    # the triangle is filled, as the drawing's arrowheads are
+    assert re.search(r'<path d="M[^"]+ Z" fill="currentColor" stroke-linejoin="miter"/>', svg)
 
 
 def test_mosfet_terminals_and_channel_type(tmp_path):
@@ -214,6 +235,9 @@ def test_switch_control_is_marked_like_a_dependent_source():
     assert by_name['w__s2'] == 'w__s2,out,0,in,0,ve__v1'         # v1 sits exactly on (in, 0)
     svg = ns.draw(circ)['svg']
     assert 'class="refk"' in svg          # the + / - a control puts on what it reads
+    # two switches, each with an open circle at both contacts
+    assert svg.count('r="%g" fill="none"/>' % sc.SW_CONTACT_R) == 4
+    assert not any('HIGH_SW' in s or 'LOW_SW' in s for s in labels(svg))   # the control, not the model
     # with no control written, the switch is labelled by its sensing pair
     el = sc.parse_circuit('e__v1,a,0,1:w__s1,a,b,c,0:r__r1,b,0,1:r__r2,c,0,1',
                           expand_si=False)[1]
